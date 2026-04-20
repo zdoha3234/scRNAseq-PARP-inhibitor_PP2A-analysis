@@ -1,0 +1,716 @@
+---
+title: "s5_17_4_26_ Combination vs solo treatment"
+author: "zod"
+date: "17/04/2026"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center', out.width = "90%", fig.asp = 0.52)
+```
+
+<style>
+    body .main-container {
+        max-width: 2160px;
+    }
+</style>
+
+# Experiment & contact info
+
+PIs: Rosalie Sears (searsr@ohsu.edu), Laura Heiser (heiserl@ohsu.edu)
+
+Sample preparation: Zinab Doha (dohaz@ohsu.edu)
+
+Library prep from single cells: Xi Li & Colin Daniel (danielc@ohsu.edu)
+
+Analysis: Nick Calistri (calistri@ohsu.edu) and Zinab Doha (dohaz@ohsu.edu)
+
+Sequencing performed by OHSU MPSSR
+
+## Analysis design
+
+- load rliger integrated data (s3_celltypes.rds)
+
+- separate each lineage with multiple clusters (epithelial, fibroblast, lymphoid, myeloid)
+
+- perform DE within each lineage
+
+- Convert cluster to celltype and annotate with relevant pathway/expression 
+
+- Save integrated seurat obejct (s4_so_merge.rds) as well as the lineage subset seurat objects
+
+
+### Object names
+
+epi = epithelial
+sni = stromal non-immune
+lym = lymphoid
+mye = myeloid
+
+# Set up
+
+## Load libraries
+```{r}
+library(Matrix)
+library(tidyverse)
+library(Seurat)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(future)
+plan("multisession",
+     workers = 12)
+options(future.globals.maxSize = 25000 * 1024^2) # Sets future maxsize to 2500 MiB
+
+library(rliger)
+#library(SeuratWrappers)
+library(UpSetR)
+library(eulerr)
+```
+
+## Set seed
+
+```{r}
+set.seed(4)
+```
+
+
+## load s3_celltypes.rds
+
+```{r}
+so_merge <- readRDS('analysis_files/s3_lineages_250505.rds')
+
+# Consider batch the vial of tubes that was split across two 10X lanes (prefix of library_id)
+
+so_merge@meta.data$batch <- str_split(so_merge@meta.data$library_id,
+                                      pattern = '_',
+                                      simplify = TRUE)[,1]
+
+# Remove any previous clustering attempts
+so_merge@meta.data <- so_merge@meta.data %>%
+  dplyr::select(-grep(colnames(so_merge@meta.data),
+                      pattern = '*snn_res*',
+                      value = TRUE))
+
+```
+
+## Create subset seurat objects
+
+```{r}
+so_epi <- subset(so_merge, subset = lineage == 'epithelial')
+
+so_lym <- subset(so_merge, subset = lineage == 'lymphoid')
+
+so_mye <- subset(so_merge, subset = lineage == 'myeloid')
+
+so_str <- subset(so_merge, subset = lineage == 'stromal')
+
+# Set default ndims
+ndims <- 10
+```
+
+
+# Set up metadata colors
+```{r}
+
+phenotype_rename <- tibble(shortname = c('V', 'R', 'S', 'DT', 'PD'),
+                           longname = c('Vehicle', 'PARPi_R', 'PARPi_S', 'PP2A', 'Combo'))
+
+so_merge@meta.data$phenotype <- plyr::mapvalues(x = so_merge@meta.data$phenotype,
+                                              from = phenotype_rename$shortname,
+                                               to = phenotype_rename$longname)
+
+
+col_dic <- tibble(names = c(  'Combo', 'PARPi_R', 'PARPi_S','PP2A' , 'Vehicle'),
+                   colors = c( '#7CAE00', '#F8766D', '#00A9FF', '#C77CFF' ,   '#666666' ))
+```
+
+
+
+## Prepare DEG function
+
+```{r}
+subset_ego <- function(curr_sub, curr_markers){
+
+  if(nrow(curr_markers) > 1){
+    
+    curr_top <- curr_markers %>%
+      filter(avg_log2FC > 0.5) %>%
+      group_by(cluster) %>%
+      arrange(desc(avg_log2FC)) %>%
+      filter(p_val_adj <= 0.05) %>%
+      slice_head(n = 5)
+    
+    DoHeatmap(curr_sub, features = curr_top$gene)
+    
+    for(i in unique(curr_markers$cluster)){
+      
+      
+      clust_markers <- curr_markers %>%
+        filter(cluster == i)
+      
+      volcano_plot <- ggplot(clust_markers, aes(x = avg_log2FC, y = -log10(p_val_adj), label = gene))+
+        geom_point()+
+        ggrepel::geom_text_repel()+
+        ggtitle(paste0('Cluster: ', i))
+      
+      print(volcano_plot)
+      
+      print(paste0('Evaluating cluster: ', i))
+      curr_top <- curr_markers %>%
+        filter(cluster == i) %>%
+        filter(avg_log2FC >= 0.5) %>%
+        filter(p_val_adj <= 0.05)
+      
+      curr_bottom <- curr_markers %>%
+        filter(cluster == i) %>%
+        filter(avg_log2FC <= -0.5) %>%
+        filter(p_val_adj <= 0.05)
+    
+      ego_top <- enrichGO(gene = curr_top$gene,
+                OrgDb = org.Mm.eg.db,
+                keyType = 'SYMBOL',
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05)
+  
+      if(if(!is.null(ego_top)){nrow(ego_top) > 0 & nrow(curr_top) >= 3}){
+        ego_top_genelist <- curr_top$avg_log2FC
+        names(ego_top_genelist) <- curr_top$gene
+        ego_top_genelist <- sort(ego_top_genelist, decreasing = TRUE)
+        
+        p1 <- dotplot(ego_top, title = paste0('Cluster ', i))
+        
+        p2 <- cnetplot(ego_top,
+                       showCategory = 10,
+                       foldChange = ego_top_genelist,
+                       colorEdge = TRUE)
+        
+        p3 <- heatplot(ego_top,
+                       showCategory = 10,
+                       foldChange = ego_top_genelist)
+        
+        print(p1)
+        print(p2)
+        print(p3)
+    }else(
+      print('No upregulated GOs found')
+    )
+      
+    
+    }
+      
+  }else{
+    print('FindAllMarkers did not return DEGs (only one cluster in celltype?)')
+  }  
+}
+```
+
+
+
+## Combination vs solo treatment
+
+```{r}
+# Subset to MYCi (DT), PARPi resistant (R) or combination (PD) treatment
+so_combo <- subset(so_merge, subset = phenotype %in% c('DT', 'PD', 'R'))
+
+# Set identity to treatment/response phenotype
+Idents(so_combo) <- 'phenotype'
+
+# Sweep through lineages and compute DEGs
+for(i in unique(so_combo@meta.data$lineage)){
+  # Subset to just current lineage being tested
+  so_curr <- subset(so_combo, subset = lineage == i)
+  
+  # Find DEGs
+  pd_v_r_markers <- FindMarkers(so_curr,
+                              ident.1 = 'PD',
+                              ident.2 = 'R')
+  
+  pd_v_dt_markers <- FindMarkers(so_curr,
+                              ident.1 = 'PD',
+                              ident.2 = 'DT')
+  
+  # Annotate which lineage these belong to and gene name
+  pd_v_r_markers$lineage <- i
+  pd_v_r_markers$gene <- rownames(pd_v_r_markers)
+  pd_v_dt_markers$lineage <- i
+  pd_v_dt_markers$gene <- rownames(pd_v_dt_markers)
+  
+  # Combine together by gene name
+  
+  combo_markers <- full_join(x = pd_v_r_markers,
+                             y = pd_v_dt_markers,
+                             by = 'gene',
+                             suffix = c('.pd_vs_r', '.pd_vs_dt'))
+  
+  # Fill in missing values (if logfc is NA, set to 0, if p val is NA set to 1)
+  combo_markers$avg_log2FC.pd_vs_r[is.na(combo_markers$avg_log2FC.pd_vs_r)] <- 0
+  combo_markers$avg_log2FC.pd_vs_dt[is.na(combo_markers$avg_log2FC.pd_vs_dt)] <- 0
+  combo_markers$p_val_adj.pd_vs_r[is.na(combo_markers$p_val_adj.pd_vs_r)] <- 1
+  combo_markers$p_val_adj.pd_vs_dt[is.na(combo_markers$p_val_adj.pd_vs_dt)] <- 1
+  
+  # bi-Volcano plot
+  combo_sig <- combo_markers %>%
+    filter(abs(avg_log2FC.pd_vs_r) > 0.5) %>%
+    filter(abs(avg_log2FC.pd_vs_dt) > 0.5) %>%
+    filter(p_val_adj.pd_vs_r < 0.05) %>%
+    filter(p_val_adj.pd_vs_dt < 0.05)
+  
+  bivolp <- ggplot(combo_markers, aes(x = avg_log2FC.pd_vs_r, y = avg_log2FC.pd_vs_dt, label = gene))+
+    geom_point()+
+    ggrepel::geom_text_repel(data = combo_sig, aes(x = avg_log2FC.pd_vs_r, y = avg_log2FC.pd_vs_dt, label = gene))+
+    geom_point(data = combo_sig, aes(x = avg_log2FC.pd_vs_r, y = avg_log2FC.pd_vs_dt, label = gene), color = 'red')+
+    ggtitle(i)+
+    theme_bw()+
+    xlab('PD vs PARPi Resistant \n Average Log2FC')+
+    ylab('PD vs MYCi \n Average Log2FC')+
+    geom_abline(slope = 1, linetype = 'dashed')+
+    coord_equal()
+  
+  plot(bivolp)
+  
+  
+  #Append DEG markers to combo_lin_markers
+  if(i == unique(so_combo@meta.data$lineage)[1]){
+    combo_vs_r <- pd_v_r_markers
+    combo_vs_dt <- pd_v_dt_markers
+  }else{
+    combo_vs_r <- rbind(combo_vs_r,
+                        pd_v_r_markers)
+    combo_vs_dt <- rbind(combo_vs_dt,
+                         pd_v_dt_markers)
+  }
+}
+
+write_csv(combo_vs_r, 'analysis_files/s4_combo_vs_parpiR_markers.csv')
+write_csv(combo_vs_dt, 'analysis_files/s4_combo_vs_myci_markers.csv')
+```
+```{r}
+pdr <- read_csv('analysis_files/s4_combo_vs_parpiR_markers.csv')
+
+ # 2/2/23 - added ego
+  curr_top <- pdr %>%
+    filter(p_val_adj < 0.05 & avg_log2FC > 0.5)
+  
+  curr_bottom <- pdr %>%
+    filter(p_val_adj < 0.05 & avg_log2FC < -0.5)
+  
+  
+  ego_top <- enrichGO(gene = curr_top$gene,
+                OrgDb = org.Mm.eg.db,
+                keyType = 'SYMBOL',
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05)
+  
+  ego_bottom <- enrichGO(gene = curr_bottom$gene,
+                OrgDb = org.Mm.eg.db,
+                keyType = 'SYMBOL',
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05)
+  
+  
+    if(if(!is.null(ego_top)){nrow(ego_top) > 0 & nrow(curr_top) >= 3}){
+        ego_top_genelist <- curr_top$avg_log2FC
+        names(ego_top_genelist) <- curr_top$gene
+        ego_top_genelist <- sort(ego_top_genelist, decreasing = TRUE)
+        
+        p1 <- dotplot(ego_top, title = paste0('Cluster ', i))
+        
+        p2 <- cnetplot(ego_top,
+                       showCategory = 10,
+                       foldChange = ego_top_genelist,
+                       colorEdge = TRUE)
+        
+        p3 <- heatplot(ego_top,
+                       showCategory = 10,
+                       foldChange = ego_top_genelist)
+        
+        print(p1)
+        print(p2)
+        print(p3)
+    }else{
+      print('No upregulated GOs found')
+    }
+  
+    if(if(!is.null(ego_bottom)){nrow(ego_bottom) > 0 & nrow(curr_bottom) >= 3}){
+        ego_bottom_genelist <- curr_bottom$avg_log2FC
+        names(ego_bottom_genelist) <- curr_bottom$gene
+        ego_bottom_genelist <- sort(ego_bottom_genelist, decreasing = TRUE)
+        
+        p4 <- dotplot(ego_bottom, title = paste0('Cluster ', i))
+        
+        p5 <- cnetplot(ego_bottom,
+                       showCategory = 10,
+                       foldChange = ego_bottom_genelist,
+                       colorEdge = TRUE)
+        
+        p6 <- heatplot(ego_bottom,
+                       showCategory = 10,
+                       foldChange = ego_bottom_genelist)
+        
+        print(p4)
+        print(p5)
+        print(p6)
+    }else{
+      print('No upregulated GOs found')
+    }
+  
+  
+  # Append DEG markers to parp_lin_markers
+  if(i == unique(so_DTV@meta.data$lineage)[1]){
+    parp_lin_markers <- curr_markers
+  }else{
+    parp_lin_markers <- rbind(parp_lin_markers,
+                              curr_markers)
+  }
+
+
+# Filter to significant genes
+parp_lin_sig_up <- parp_lin_markers %>%
+  filter(p_val_adj < 0.01 & avg_log2FC > 0.5)
+
+parp_lin_sig_down <- parp_lin_markers %>%
+  filter(p_val_adj < 0.01 & avg_log2FC < -0.5)
+
+# Convert to list for upset plot
+parp_up_list <- unstack(parp_lin_sig_up, gene~lineage)
+parp_down_list <- unstack(parp_lin_sig_down, gene~lineage) 
+
+# Create upset plot
+upset(fromList(parp_up_list))
+upset(fromList(parp_down_list))
+
+# Create Eulerr plots
+
+plot(euler(fromList(parp_up_list)),
+     quantities = TRUE,
+     labels = list(font = 4),
+     main = 'Significantly upregulated genes')
+
+plot(euler(fromList(parp_down_list)),
+     quantities = TRUE,
+     labels = list(font = 4),
+     main = 'Significantly downregulated genes')
+
+```
+
+##HR scor
+```{r}
+hr_genes <- list(HR = c("Brca1", "Brca2", "Rad51", "Rad52", "Palb2",
+                         "Rad51c", "Rad51d", "Bard1", "Atm", "Atr",
+                         "Chek1", "Chek2", "Fancd2", "Fanca", "Fancl"))
+
+# Check how many are found
+hr_genes_present <- hr_genes$HR[hr_genes$HR %in% rownames(so_epi)]
+cat("Genes found:", length(hr_genes_present), "/", length(hr_genes$HR), "\n")
+cat(hr_genes_present, "\n")
+```
+
+```{r}
+expr_matrix <- LayerData(so_epi, layer = "data")[hr_genes_present, ]
+hr_scores   <- colMeans(as.matrix(expr_matrix))
+
+so_epi@meta.data$HR_score <- hr_scores[rownames(so_epi@meta.data)]
+
+# Rebuild hr_meta
+hr_meta <- so_epi@meta.data[, c("phenotype", "HR_score")]
+hr_meta <- hr_meta[!is.na(hr_meta$HR_score), ]
+hr_meta$phenotype <- factor(hr_meta$phenotype, levels = col_dic$names)
+
+table(hr_meta$phenotype)
+```
+```{r}
+# ── Pairwise wilcox ───────────────────────────────────────────────────────────
+pwc <- hr_meta %>%
+  pairwise_wilcox_test(HR_score ~ phenotype) %>%
+  add_xy_position(x = "phenotype")
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+ggplot(hr_meta, aes(x = phenotype, y = HR_score, fill = phenotype)) +
+  geom_violin(trim = FALSE, alpha = 0.8) +
+  geom_boxplot(width = 0.15, outlier.shape = NA,
+               fill = "white", color = "black") +
+  geom_jitter(aes(color = phenotype),
+              size = 0.3, alpha = 0.3,
+              position = position_jitter(width = 0.15)) +
+  stat_pvalue_manual(
+    filter(pwc, p.adj < 0.05),
+    label         = "p.adj",
+    tip.length    = 0.01,
+    step.increase = 0.08,
+    size          = 3.5
+  ) +
+  scale_fill_manual(values  = setNames(col_dic$colors, col_dic$names)) +
+  scale_color_manual(values = setNames(col_dic$colors, col_dic$names)) +
+  theme_classic() +
+  theme(
+    legend.position = "right",
+    axis.text.x     = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(title = "HR module score",
+       x     = "Identity",
+       y     = "HR module score",
+       fill  = NULL, color = NULL)
+```
+
+##per tuomr
+```{r}
+# ── Build per-tumor HR score summary ─────────────────────────────────────────
+hr_tumor <- so_epi@meta.data[, c("phenotype", "HR_score", "tumor")]
+hr_tumor <- hr_tumor[!is.na(hr_tumor$HR_score), ]
+hr_tumor$phenotype <- factor(hr_tumor$phenotype, levels = col_dic$names)
+
+# ── Pairwise wilcox per phenotype (using tumor means) ────────────────────────
+hr_tumor_mean <- hr_tumor %>%
+  group_by(tumor, phenotype) %>%
+  summarize(mean_HR = mean(HR_score), .groups = "drop") %>%
+  mutate(phenotype = factor(phenotype, levels = col_dic$names))
+
+# Pairwise test on tumor-level means
+pwc_tumor <- hr_tumor_mean %>%
+  pairwise_wilcox_test(mean_HR ~ phenotype) %>%
+  add_xy_position(x = "phenotype")
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+ggboxplot(hr_tumor_mean,
+          x      = "phenotype",
+          y      = "mean_HR",
+          fill   = "phenotype",
+          add    = "jitter",
+          width  = 0.5) +
+  stat_pvalue_manual(
+    filter(pwc_tumor, p.adj < 0.05),
+    label         = "p.adj",
+    tip.length    = 0.01,
+    step.increase = 0.1,
+    size          = 3.5
+  ) +
+  scale_fill_manual(values  = setNames(col_dic$colors, col_dic$names)) +
+  scale_color_manual(values = setNames(col_dic$colors, col_dic$names)) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    title   = "HR module score per tumor",
+    x       = "Phenotype",
+    y       = "Mean HR score (per tumor)",
+    caption = get_pwc_label(pwc_tumor)
+  )
+
+```
+##HR genesets in MSigDB (mouse)
+```{r}
+# ── Install if needed ─────────────────────────────────────────────────────────
+# BiocManager::install("msigdbr")
+library(msigdbr)
+
+# ── Browse available HR-related genesets ──────────────────────────────────────
+# Search for HR genesets in MSigDB (mouse)
+all_genesets <- msigdbr(species = "Mus musculus")
+
+hr_sets <- all_genesets %>%
+  filter(grepl("HOMOLOGOUS_RECOMBINATION|HALLMARK_DNA_REPAIR|
+                FANCONI|RAD51|BRCA", 
+               gs_name, ignore.case = TRUE)) %>%
+  distinct(gs_name)
+
+print(hr_sets)
+
+#write.csv(hr_sets, "hr_sets.csv")
+
+```
+
+
+```{r}
+# ── Pull the best HR genesets ─────────────────────────────────────────────────
+
+# Option 1: Reactome HRR — most mechanistically curated (recommended)
+hr_reactome <- all_genesets %>%
+  filter(gs_name == "REACTOME_HDR_THROUGH_HOMOLOGOUS_RECOMBINATION_HRR")
+
+# Option 2: GO Biological Process HR — ontology-based
+hr_gobp <- all_genesets %>%
+  filter(gs_name == "GOBP_HOMOLOGOUS_RECOMBINATION")
+
+# Option 3: KEGG HR — classic pathway
+hr_kegg <- all_genesets %>%
+  filter(gs_name == "KEGG_HOMOLOGOUS_RECOMBINATION")
+
+# ── Check gene counts & overlap ───────────────────────────────────────────────
+for(gs in list(hr_reactome, hr_gobp, hr_kegg)){
+  genes_present <- gs$gene_symbol[gs$gene_symbol %in% rownames(so_epi)]
+  cat(unique(gs$gs_name), "→ total:", nrow(gs),
+      "| found in so_epi:", length(genes_present), "\n")
+}
+
+# ── Use Reactome (recommended) ────────────────────────────────────────────────
+hr_genes_msig <- list(HR = hr_reactome$gene_symbol)
+hr_genes_present <- hr_genes_msig$HR[hr_genes_msig$HR %in% rownames(so_epi)]
+cat("Using genes:\n", paste(hr_genes_present, collapse = ", "), "\n")
+
+# ── Recompute HR score ────────────────────────────────────────────────────────
+expr_matrix <- LayerData(so_epi, layer = "data")[hr_genes_present, ]
+hr_scores   <- colMeans(as.matrix(expr_matrix))
+so_epi@meta.data$HR_score <- hr_scores[rownames(so_epi@meta.data)]
+
+# ── Rebuild hr_meta & hr_tumor_mean ──────────────────────────────────────────
+hr_tumor <- so_epi@meta.data[, c("phenotype", "HR_score", "tumor")]
+hr_tumor$phenotype <- factor(hr_tumor$phenotype, levels = col_dic$names)
+
+hr_tumor_mean <- hr_tumor %>%
+  group_by(tumor, phenotype) %>%
+  summarize(mean_HR = mean(HR_score), .groups = "drop")
+
+# ── Test + plot ───────────────────────────────────────────────────────────────
+pwc_tumor <- hr_tumor_mean %>%
+  pairwise_wilcox_test(mean_HR ~ phenotype) %>%
+  add_xy_position(x = "phenotype")
+
+ggboxplot(hr_tumor_mean,
+          x     = "phenotype",
+          y     = "mean_HR",
+          fill  = "phenotype",
+          add   = "jitter",
+          width = 0.5) +
+  stat_pvalue_manual(
+    filter(pwc_tumor, p.adj < 0.05),
+    label         = "p.adj",
+    tip.length    = 0.01,
+    step.increase = 0.1,
+    size          = 3.5
+  ) +
+  scale_fill_manual(values  = setNames(col_dic$colors, col_dic$names)) +
+  scale_color_manual(values = setNames(col_dic$colors, col_dic$names)) +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x     = element_text(angle = 45, hjust = 1)) +
+  labs(title   = "HR module score (Reactome HRR)",
+       x       = "Phenotype",
+       y       = "Mean HR score (per tumor)",
+       caption = get_pwc_label(pwc_tumor))
+```
+
+```{r}
+install.packages("ggpubr")
+library(ggpubr)
+# ── Fix 1: Join layers in so_epi first ───────────────────────────────────────
+so_epi <- JoinLayers(so_epi)
+# 
+# # ── Fix 2: Load rstatix ──────────────────────────────────────────────────────
+ library(rstatix)
+# ── GOBP Homologous Recombination geneset ─────────────────────────────────────
+hr_gobp <- all_genesets %>%
+  filter(gs_name == "GOCC_BRCA1_A_COMPLEX")
+
+cat("Total genes in GOBP_HR:", nrow(hr_gobp), "\n")
+
+# ── Check overlap ─────────────────────────────────────────────────────────────
+hr_genes_present <- hr_gobp$gene_symbol[hr_gobp$gene_symbol %in% rownames(so_epi)]
+cat("Found in so_epi:", length(hr_genes_present), "/", nrow(hr_gobp), "\n")
+cat(hr_genes_present, "\n")
+
+# ── Recompute HR score ────────────────────────────────────────────────────────
+expr_matrix <- LayerData(so_epi, layer = "data")[hr_genes_present, ]
+hr_scores   <- colMeans(as.matrix(expr_matrix))
+so_epi@meta.data$HR_score <- hr_scores[rownames(so_epi@meta.data)]
+
+# ── Rebuild per-tumor means ───────────────────────────────────────────────────
+hr_tumor_mean <- so_epi@meta.data[, c("phenotype", "HR_score", "tumor")] %>%
+  filter(!is.na(HR_score)) %>%
+  mutate(phenotype = factor(phenotype, levels = col_dic$names)) %>%
+  group_by(tumor, phenotype) %>%
+  summarize(mean_HR = mean(HR_score), .groups = "drop")
+
+# ── Pairwise wilcox ───────────────────────────────────────────────────────────
+pwc_tumor <- hr_tumor_mean %>%
+  pairwise_wilcox_test(mean_HR ~ phenotype) %>%
+  add_xy_position(x = "phenotype")
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+ggboxplot(hr_tumor_mean,
+          x     = "phenotype",
+          y     = "mean_HR",
+          fill  = "phenotype",
+          add   = "jitter",
+          width = 0.5) +
+  stat_pvalue_manual(
+    filter(pwc_tumor, p.adj < 0.05),
+    label         = "p.adj",
+    tip.length    = 0.01,
+    step.increase = 0.1,
+    size          = 3.5
+  ) +
+  scale_fill_manual(values  = setNames(col_dic$colors, col_dic$names)) +
+  scale_color_manual(values = setNames(col_dic$colors, col_dic$names)) +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x     = element_text(angle = 45, hjust = 1)) +
+  labs(title   = "HR module score (GOBP_HOMOLOGOUS_RECOMBINATION)",
+       x       = "Phenotype",
+       y       = "Mean HR score (per tumor)",
+       caption = get_pwc_label(pwc_tumor))
+```
+
+
+##cluster_frequency_stats
+```{r}
+library(ggpubr)
+library(rstatix)
+
+# Loop to plot all epi subtypes, or pick one
+sub_of_interest <- 'epi_4-Tcell_activation'  # change to any epi_subtype name
+
+soi <- so_meta_tumors_epi %>%
+  ungroup() %>%
+  filter(epi_subtype == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(phenotype, freq) %>%
+  pairwise_t_test(freq ~ phenotype) %>%
+  add_xy_position(x = 'phenotype')
+
+ggboxplot(soi, 
+          x     = "phenotype", 
+          y     = "freq", 
+          color = "phenotype", 
+          add   = "jitter") +
+  scale_color_manual(values = setNames(col_dic$colors, col_dic$names)) +
+  stat_pvalue_manual(
+    filter(soi_pwc, p.adj < 0.25), 
+    label         = "p.adj", 
+    tip.length    = 0, 
+    step.increase = 0.1
+  ) +
+  labs(caption = get_pwc_label(soi_pwc)) +
+  ggtitle(sub_of_interest) +
+  ylab('Frequency of subcluster in lineage (per tumor)') +
+  xlab('') +
+  theme(legend.position = 'none') +
+  RotatedAxis()
+```
+
+```{r, eval = FALSE}
+saveRDS(so_merge, file = 'analysis_files/s4_so_merge.rds')
+```
+
+
+
+# sessionInfo()
+
+```{r}
+sessionInfo()
+```
+

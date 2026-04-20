@@ -1,0 +1,404 @@
+---
+title: "s2_260120_qc_dimred"
+author: "nlc and ZOD"
+date: "20/01/2026"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center', out.width = "90%", fig.asp = 0.52)
+```
+
+<style>
+    body .main-container {
+        max-width: 2160px;
+    }
+</style>
+
+# Experiment & contact info
+
+PIs: Rosalie Sears (searsr@ohsu.edu), Laura Heiser (heiserl@ohsu.edu)
+
+Sample preparation: Zinab Doha (dohaz@ohsu.edu) and (ztoha@taibahu.edu.sa)
+
+Library prep from single cells: Xi Li & Colin Daniel (danielc@ohsu.edu)
+
+Analysis: Nick Calistri (calistri@ohsu.edu)
+
+Sequencing performed by OHSU MPSSR
+
+## Analysis design
+
+- load so_list.rds
+
+- combine all libraries into so_merge
+
+- process so_merge like normal (dimred & clustering)
+
+- Compute qc metrics and calculate cellcycle score
+
+- Analyze doublet calls vs cluster id to see if any clusters are majority doublet
+
+- Filter based on QC metrics and sample ID
+
+- Perform: Normalization, variablefeature selection, linear (PCA) and non linear (UMAP) dimensionality reduction using both standard and SCTransform workflows
+
+- save filtered seurat objects as .rds files
+
+# Set up
+
+## Load environment from local project renv
+
+```{r}
+if(!dir.exists('renv')){
+  print('Error - renv library not found')
+}else{
+  print('Loading packages from local renv library')
+  library(renv)
+  renv::load()
+}
+```
+
+## Load libraries
+```{r}
+#library(Matrix)
+library(tidyverse)
+library(Seurat)
+#library(rliger)
+library(SeuratWrappers)
+#library(ggalluvial)
+library(harmony)
+```
+
+## load s1_so_list.rds
+
+```{r}
+#so_list <- readRDS('analysis_files/s1_seurat_list.rds')
+
+so_files <- list.files('analysis_files/', pattern = '250505.rds') %>%
+  grep(., pattern = '^s1', value = TRUE)
+
+so_list <- list()
+for(i in so_files){
+  curr_so <- readRDS(paste0('analysis_files/', i))
+  curr_lib_name <- unique(curr_so@meta.data$library_id)
+  
+  so_list[[curr_lib_name]] <- curr_so
+  rm(curr_so)
+}
+
+gc()
+```
+
+## Mouse/tumor stats from README metadata file
+
+```{r}
+# Read in readme with HTO and tumor ID
+lib_meta <- read_csv('original_data/221111_README.csv')
+
+# Add the run_library variable
+lib_meta <- lib_meta %>%
+  mutate(run_library = paste0(mpssr_seq_run_name,
+                              '_',
+                              mpssr_library_name,
+                              str_replace_na(library_suffix, replacement = '')))
+
+lib_meta$mouse_id <- str_split(lib_meta$condition_string, pattern = '_', simplify = TRUE)[,1]
+
+tumor_histology_dict <- lib_meta %>%
+  dplyr::select(condition_string, histology) %>%
+  distinct()
+```
+
+# Perform QC filtering and subsample to 500 cells per tumor per library
+
+```{r}
+for(i in 1:length(so_list)){
+  curr_so <- so_list[[i]]
+  
+  # Add metadata: percent.mt, phenotype (from tumor ID)
+  curr_so[['percent.mt']] <- PercentageFeatureSet(curr_so, pattern = '^mt-')
+  
+  curr_so[['percent.ribo']] <- PercentageFeatureSet(curr_so, pattern = '^Rp[sl][[:digit:]]')
+  
+  curr_so[['phenotype']] <- str_replace(str_split(curr_so@meta.data$tumor,
+                                                   pattern = '_',
+                                                   simplify = TRUE)[,1],
+                                         '[:digit:]+',
+                                         '')
+  
+  curr_so[['mouse']] <- str_split(curr_so@meta.data$tumor,
+                      pattern = '_',
+                      simplify = TRUE)[,1]
+  
+  curr_so[['histology']] <- plyr::mapvalues(x = curr_so@meta.data$tumor,
+                                             from = tumor_histology_dict$condition_string,
+                                             to = tumor_histology_dict$histology)
+
+  # Filter to only cells with >250 features, <25% mitochondrial reads and assigned Singlet from DF and HTO demultiplex
+  meta_filtered <- curr_so@meta.data %>%
+    filter(nFeature_RNA > 300) %>%
+    filter(nCount_RNA > 1000) %>%
+    filter(percent.mt < 15) %>%
+    filter(percent.ribo < 50) %>%
+    filter(DF.classifications == 'Singlet') %>%
+    filter(HTO_classification.global == 'Singlet')
+  
+  # rm(cells_to_keep)
+  # for(j in 1:length(unique(meta_filtered$mouse))){
+  #   curr_mouse <- meta_filtered %>%
+  #     filter(mouse == unique(meta_filtered$mouse)[j])
+  #   
+  #   set.seed(i*j)
+  #   
+  #   curr_mouse_sub <- curr_mouse %>%
+  #     slice_sample(n = min(500, nrow(curr_mouse)), replace = FALSE)
+  #   
+  #   
+  #   if(j == 1){
+  #     cells_to_keep <- row.names(curr_mouse_sub)
+  #   }else{
+  #     cells_to_keep <- c(cells_to_keep,
+  #                        row.names(curr_mouse_sub))
+  #   }
+  #   
+  # }
+# 
+#   curr_so <- subset(curr_so,
+#                     cells = cells_to_keep)
+  
+  curr_so <- subset(curr_so,
+                    cells = row.names(meta_filtered))
+
+  so_list[[i]] <- curr_so
+}
+```
+
+
+# Merge data and visualize QC metrics
+
+## Merge seurat objects (no integration, simple appending)
+
+```{r}
+so_merge <- merge(x = so_list[[1]], y = unlist(so_list)[-1])
+```
+
+### Remove old seurat objects/lists and run GC
+
+```{r}
+so_list <- NULL
+gc()
+```
+
+# QC stats table for supplement
+```{r}
+# Stats table
+so_tumor_stats <- so_merge@meta.data %>%
+  group_by(tumor) %>%
+  summarize(nCells = n(),
+            mean_nCount_RNA = mean(nCount_RNA),
+            mean_nFeature_RNA = mean(nFeature_RNA),
+            mean_percent.mt = mean(percent.mt)) 
+
+so_tumor_stats %>%
+  DT::datatable()
+
+# Statistics used in results text
+
+## Number of tumors
+length(unique(so_merge@meta.data$tumor))
+
+## Number of mice
+length(unique(so_merge@meta.data$mouse))
+
+## Number of unique libraries
+length(unique(so_merge@meta.data$library_id))
+
+## Mean and range number of cells per tumor
+range(so_tumor_stats$nCells)
+sum(so_tumor_stats$nCells)
+
+## Mean genes per cell
+mean(so_merge@meta.data$nFeature_RNA)
+mean(so_merge@meta.data$nCount_RNA)
+
+## Number of cells per tumor
+so_merge@meta.data %>%
+  dplyr::select(tumor, phenotype) %>%
+  table()
+
+```
+
+# Filter to samples of interest, run standard Seurat dimred and save
+
+## Filter samples of interest
+
+```{r}
+# Subset to samples of interest
+#so_filt <- subset(so_merge, subset = phenotype #%in% c('V', 'R', 'S'))
+
+# Remove unneeded so_merge object and clean up
+#rm(so_merge)
+#gc()
+```
+
+## Standard seurat analysis (log normalization)
+
+```{r}
+so_filt <- NormalizeData(so_merge)
+so_filt <- FindVariableFeatures(so_filt,
+                                nfeatures = 5000)
+so_filt <- ScaleData(so_filt)
+so_filt <- RunPCA(so_filt)
+ElbowPlot(so_filt, ndims = 50)
+
+so_filt <- RunUMAP(so_filt, dims = 1:20)
+```
+
+
+
+## Save results
+
+```{r}
+saveRDS(so_filt, file = 'analysis_files/s2_vsr_standard.rds')
+```
+
+
+## Visualize output
+
+```{r, fig.asp = 1}
+DimPlot(so_filt,
+        group.by = 'library_id')+
+  coord_equal()
+
+DimPlot(so_filt,
+        group.by = 'tumor')+
+  coord_equal()
+
+DimPlot(so_filt,
+        group.by = 'phenotype', split.by = 'phenotype')+
+  coord_equal()
+
+FeaturePlot(so_filt,
+            features = c('nFeature_RNA', 'nCount_RNA'),
+            coord.fixed = TRUE)
+```
+
+```{r, fig.asp = 3}
+DimPlot(so_filt,
+        label = FALSE,
+        group.by = 'tumor')+
+  coord_equal()+
+  facet_wrap(~tumor, ncol = 3)+
+  theme(legend.position = 'none')
+```
+
+## Save results
+
+```{r}
+saveRDS(so_filt, file = 'analysis_files/s2_vsr_standard.rds')
+```
+
+# Run SCT
+
+## Run SCT normalization
+
+```{r}
+so_sct <- SCTransform(so_filt,
+                      method = 'glmGamPoi',
+                      variable.features.n = 5000,
+                      vars.to.regress = c('percent.mt', 'percent.ribo'))
+
+# Remove so_filt
+rm(so_filt)
+gc()
+```
+
+## Dimred on SCT normalized
+
+```{r}
+so_sct <- ScaleData(so_sct)
+so_sct <- RunPCA(so_sct)
+ElbowPlot(so_sct, ndims = 50)
+
+so_sct <- RunUMAP(so_sct, dims = 1:20)
+```
+
+
+## Visualize output
+
+```{r, fig.asp = 1}
+DimPlot(so_sct,
+        group.by = 'library_id')+
+  coord_equal()
+
+DimPlot(so_sct,
+        group.by = 'tumor')+
+  coord_equal()
+
+DimPlot(so_sct,
+        group.by = 'phenotype', split.by = 'phenotype')
+
+FeaturePlot(so_sct,
+            features = c('nFeature_RNA', 'nCount_RNA'),
+            coord.fixed = TRUE)
+```
+
+
+```{r, fig.asp = 3}
+DimPlot(so_sct,
+        label = FALSE,
+        group.by = 'tumor')+
+  coord_equal()+
+  facet_wrap(~tumor, ncol = 3)+
+  theme(legend.position = 'none')
+```
+
+## Save results
+
+```{r}
+saveRDS(so_sct, file = 'analysis_files/s2_vsr_sct_250505.rds')
+```
+
+# Harmony integration
+
+```{r}
+# so_sct <- readRDS(file = 'analysis_files/s2_vsr_sct_250505.rds')
+# 
+# so_sct@meta.data$batch_id <- str_split(so_sct@meta.data$library_id,
+#                                     pattern = '_',
+#                                     simplify = TRUE)[,1]
+# 
+# # so_sct_split <- so_sct[["SCT"]] <- split(so_sct[["SCT"]], f = so_sct$batch)
+# # 
+# # so_harmony <- IntegrateLayers(object = so_sct_split,
+# #                               method = HarmonyIntegration,
+# #                               orig.reduction = "pca",
+# #                               new.reduction = 'harmony',
+# #                               assay = "SCT",
+# #                               verbose = TRUE)
+# 
+# so_harmony <- harmony::RunHarmony(so_sct,
+#                          group.by.vars = 'batch_id',
+#                          reduction = 'pca',
+#                          assay.use = 'SCT',
+#                          project.dim = FALSE,
+#                          verbose = TRUE)
+# 
+# saveRDS(so_harmony, file = 'analysis_files/s2_vsr_harmony_250505.rds')
+
+```
+
+
+# sessionInfo()
+
+```{r}
+sessionInfo()
+```
+

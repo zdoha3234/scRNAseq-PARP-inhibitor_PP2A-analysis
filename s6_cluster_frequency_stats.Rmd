@@ -1,0 +1,873 @@
+---
+title: "260120_s6_cluster_frequency_stats"
+author: "nlc and zod"
+date: "2026-04-20"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up
+
+## Script goals
+
+- Read in subclustered seurat object of MycPtenfl tumors from all treatments/phenotypes
+
+- Collapse the Fibroblast, Endothelial and Perivascular lineages into a single 'stromal' lineage
+
+- For each tumor: Compute the proportion of tumor which was subcluster, proportion of lineage which was subcluster
+
+- Perform pairwise t.test across phenotype/treatments to identify subclusters which are significantly enriched in a given phenotype
+
+- General purpose code to plot boxplots with significance visualized
+
+- PCA/UMAP embedding of cluster proportion
+
+- Correlation of cluster proportion to highlight potentially correlated clusters
+
+- 
+
+## Load libraries
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(rstatix)
+library(ggpubr)
+```
+
+## Load data
+
+```{r}
+so <- readRDS('analysis_files/s4_so_merge_subclusters.rds')
+
+# Recode stromal lineages (combine fibroblast/endothelial/perivascular into just 'stromal')
+#so@meta.data$lineage <- ifelse(so@meta.data$lineage %in% c('fibroblast', 'endothelial', 'perivascular'),
+                          #     'stromal',
+                            #   so@meta.data$lineage)
+
+# Map subcluster <-> lineage
+sub_lin_dict <- so@meta.data %>%
+  dplyr::select(subcluster, lineage) %>%
+  distinct()
+
+# Map tumor <-> lib_exp (library/experiment - the day that experiment was performed representing experimental batch but NOT exactly sequencing library since HTO pooled samples were split on duplicate 10X lanes)
+tumor_lib_dict <- so@meta.data %>%
+  mutate(lib_exp = str_split(str_remove(library_id, pattern = '../'), pattern = '_', simplify = TRUE)[,1]) %>%
+  dplyr::select(tumor, lib_exp) %>%
+  distinct()
+```
+
+# Set up metadata colors
+```{r}
+
+treatment_rename <- tibble(shortname = c('V', 'R', 'S', 'DT', 'PD'),
+                           longname = c('Vehicle', 'PARPi_R', 'PARPi_S', 'PP2A', 'Combo'))
+
+so@meta.data$treatment <- plyr::mapvalues(x = so@meta.data$phenotype,
+                                              from = treatment_rename$shortname,
+                                               to = treatment_rename$longname)
+
+
+col_dic <- tibble(names = c(  'PARPi_S', 'Combo', 'PARPi_R','PP2A' , 'Vehicle'),
+                   colors = c( '#7CAE00', '#F8766D', '#00A9FF', '#C77CFF' ,   '#666666' ))
+```
+
+# Pre process
+
+## Compute proportions for each tumor
+
+freq = proportion of tumor (per tumor)
+
+freq_lineage = proportion of lineage (per tumor)
+
+```{r}
+so_meta_tumors <- so@meta.data %>%
+  dplyr::select(subcluster, phenotype, lineage, tumor) %>%
+  group_by(tumor, phenotype, subcluster, lineage) %>%
+  summarize(n_cells = n()) %>%
+  group_by(tumor) %>%
+  mutate(freq = n_cells/sum(n_cells)) %>%
+  group_by(tumor, lineage) %>%
+  mutate(freq_lineage = n_cells/sum(n_cells))  %>%
+  mutate(treatment = plyr::mapvalues(x = phenotype,
+                                              from = treatment_rename$shortname,
+                                               to = treatment_rename$longname))
+  
+# Expand all possible subcluster x tumor combinations
+subcluster_tumor_expanded <- so_meta_tumors %>%
+  ungroup() %>%
+  tidyr::expand(subcluster, tumor)
+
+# Combine observations with expanded subcluster x tumor combinations, fill in NAs where appropriate
+so_meta_complete <- full_join(x = subcluster_tumor_expanded,
+                              y = so_meta_tumors,
+                              suffix = c('', ''),
+                              by = c('subcluster', 'tumor')) %>%
+  mutate(phenotype = ifelse(is.na(phenotype),
+                            gsub("[^a-zA-Z]", "", str_split(tumor, pattern = '_', simplify = TRUE)[,1]),
+                            phenotype)) %>%
+  mutate(lineage = ifelse(is.na(lineage),
+                          plyr::mapvalues(x = subcluster,
+                                          from = sub_lin_dict$subcluster,
+                                          to = sub_lin_dict$lineage),
+                          lineage)) %>%
+  mutate(n_cells = ifelse(is.na(n_cells), 0, n_cells)) %>%
+  mutate(freq = ifelse(is.na(freq), 0, freq)) %>%
+  mutate(freq_lineage = ifelse(is.na(freq_lineage), 0, freq_lineage)) %>%
+  mutate(lib_exp = plyr::mapvalues(x = tumor,
+                                   from = tumor_lib_dict$tumor,
+                                   to = tumor_lib_dict$lib_exp))  %>%
+  mutate(treatment = plyr::mapvalues(x = phenotype,
+                                              from = treatment_rename$shortname,
+                                               to = treatment_rename$longname)) %>%
+  mutate(treatment = factor(treatment, levels = c('PP2A', 'Combo',  'PARPi_R', 'PARPi_S', 'Vehicle')))
+
+```
+
+## Barplot to visualize data overall
+
+error bar represents SEM
+
+```{r, fig.asp = 1}
+n_tumors <- so@meta.data %>%
+  group_by(treatment) %>%
+  dplyr::select(treatment, tumor) %>%
+  distinct() %>%
+  summarize(n_tumors = n())
+
+
+so_meta_tumors_summary <- so_meta_tumors %>%
+  mutate(tumor_count  = as.numeric(plyr::mapvalues(x = treatment,
+                                                     from = n_tumors$treatment,
+                                                     to = n_tumors$n_tumors)))%>%
+  group_by(treatment, subcluster, lineage, tumor_count) %>%
+  summarize(mean_freq = mean(freq),
+            sd_freq = sd(freq))
+
+ggplot(so_meta_tumors_summary, aes(y = subcluster, x = mean_freq, fill = treatment))+
+  geom_col(position = 'dodge')+
+  theme_bw()+
+  geom_errorbar(aes(y = subcluster, xmin = mean_freq - sd_freq/(tumor_count^0.5), xmax = mean_freq + sd_freq/(tumor_count^0.5)), position = 'dodge', width = 0.5)+
+  facet_grid(rows = vars(lineage), cols = vars(treatment), scales = 'free_y', space = 'free')+
+  theme(strip.text.y.right = element_text(angle = 0))+
+  xlab('Mean frequency')+
+  ylab('Celltype \n (cluster_lineage_celltype)')
+```
+# Celltype fractions
+
+## Visualize celltype fractions per tumor
+```{r}
+
+
+
+so_merge_meta <- so_merge@meta.data %>%
+  mutate(tumor_pheno = paste0(tumor, '-', treatment))
+
+freq_table <- so_merge_meta %>%
+  dplyr::select(lineage, tumor_pheno) %>%
+  table()
+
+col_anno <- data.frame(treatment = str_split(colnames(freq_table), pattern = '-', simplify = TRUE)[,2],
+                       log10_n_cells = log10(colSums(freq_table)),
+                       row.names = colnames(freq_table))
+
+pheatmap::pheatmap(prop.table(freq_table, margin = 2), 
+                   display_numbers = freq_table,
+                   main = 'celltype fraction \n Number = n_cells per celltype per tumor',
+                   annotation_col = col_anno)
+```
+
+# Statistical testing
+
+## (phenotype) Pairwise  t test for proportion of tumor
+
+```{r}
+pwc_all <- so_meta_complete %>%
+  ungroup() %>%
+  group_by(subcluster) %>%
+  dplyr::select(subcluster, freq, treatment) %>%
+  pairwise_t_test(freq~treatment)
+
+write_csv(pwc_all, 'pwt_all.csv')
+
+pwc_all %>%
+  filter(p.adj < 0.05) %>%
+  knitr::kable()
+```
+
+## (phenotype) Pairwise t.test for proportion of lineage
+
+```{r}
+pwc_all_lin <- so_meta_complete %>%
+  ungroup() %>%
+  group_by(subcluster) %>%
+  dplyr::select(subcluster, freq_lineage, treatment) %>%
+  pairwise_t_test(freq_lineage~treatment)
+
+write_csv(pwc_all_lin, 'pwt_all_lineage.csv')
+
+pwc_all_lin %>%
+  filter(p.adj < 0.05) %>%
+  knitr::kable()
+```
+
+
+## (lib_exp) Pairwise t test for proportion of tumor
+
+```{r}
+pwc_all_lib_exp <- so_meta_complete %>%
+  ungroup() %>%
+  group_by(subcluster) %>%
+  dplyr::select(subcluster, freq, lib_exp) %>%
+  pairwise_t_test(freq~lib_exp)
+
+pwc_all_lib_exp %>%
+  filter(p.adj < 0.05) %>%
+  knitr::kable()
+```
+
+## (phenotype) Pairwise t.test for proportion of lineage
+
+```{r}
+pwc_all_lin_lib_exp <- so_meta_complete %>%
+  ungroup() %>%
+  group_by(subcluster) %>%
+  dplyr::select(subcluster, freq_lineage, lib_exp) %>%
+  pairwise_t_test(freq_lineage~lib_exp)
+
+
+pwc_all_lin_lib_exp %>%
+  filter(p.adj < 0.05) %>%
+  knitr::kable()
+```
+
+# Boxplot with stats
+
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'lym_7'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter')+ scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666')) +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+
+
+
+## Proportion of lineage
+
+```{r}
+
+
+
+sub_of_interest <- 'lym_7'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')  
+```
+#lym_0
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'lym_0'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+
+
+
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'lym_0'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+#mye_o
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'mye_0'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+
+
+
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'mye_0'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+#mye_3
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'mye_3'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+
+
+
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'mye_3'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+#mye_4
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'mye_4'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+
+
+
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'mye_4'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+
+## epi4
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'epi_4'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+ filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+ 
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'epi_4'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+## epi5
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'epi_5'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +  scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'epi_5'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+## epi1
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'epi_1'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'epi_1'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+## epi9
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'epi_9'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'epi_9'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+## epi10
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'epi_10'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'epi_10'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+## str_5
+## Proportion of tumor
+
+```{r}
+sub_of_interest <- 'str_5'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq) %>%
+  pairwise_t_test(freq~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq", color = 'treatment', add = 'jitter') +
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in tumor')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'str_5'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+## Proportion of lineage
+
+```{r}
+sub_of_interest <- 'str_6'
+
+soi <- so_meta_complete %>%
+  ungroup() %>%
+  filter(subcluster == sub_of_interest)
+
+soi_pwc <- soi %>%
+  dplyr::select(treatment, freq_lineage) %>%
+  pairwise_t_test(freq_lineage~treatment) %>%
+  add_xy_position(x = 'treatment')
+
+ggboxplot(soi, x = "treatment", y = "freq_lineage", color = 'treatment', add = 'jitter') + scale_color_manual(values=c('#C77CFF', '#7CAE00', '#F8766D', '#00A9FF' ,  '#666666'))+
+  stat_pvalue_manual(filter(soi_pwc, p.adj < 0.25), label = "p.adj", tip.length = 0, step.increase = 0.1) +
+  labs(caption = get_pwc_label(soi_pwc))+
+  ggtitle(sub_of_interest)+
+  ylab('Frequency of subcluster in lineage (per tumor)')
+```
+
+
+# Additional plots
+
+## Scatter plot of freq vs freq_lineage for each subcluster
+
+```{r, fig.asp = 2}
+ggplot(so_meta_tumors, aes(x = freq, y = freq_lineage, color = phenotype))+
+  geom_point()+
+  facet_wrap(~subcluster, scale = 'free', ncol = 5)+
+  theme_bw()+
+  RotatedAxis()
+
+so_meta_tumors$lib_exp <- plyr::mapvalues(x = so_meta_tumors$tumor,
+                                            from = tumor_lib_dict$tumor,
+                                            to = tumor_lib_dict$lib_exp)
+
+ggplot(so_meta_tumors, aes(x = freq, y = freq_lineage, color = lib_exp))+
+  geom_point()+
+  facet_wrap(~subcluster, scale = 'free', ncol = 5)+
+  theme_bw()+
+  RotatedAxis()
+
+```
+
+## PCA of proportion of tumor
+
+```{r}
+freqs <- so@meta.data %>%
+  dplyr::select(tumor, subcluster) %>%
+  table()
+
+props <- freqs %>%
+  prop.table(., margin = 1)
+
+pc.props <- prcomp(x = props)
+
+pc.tibble <- tibble(tumor = rownames(pc.props$x),
+                    PC_1 = pc.props$x[,1],
+                    PC_2 = pc.props$x[,2]) %>%
+  mutate(phenotype = gsub("[^a-zA-Z]", "", str_split(tumor, pattern = '_', simplify = TRUE)[,1])) %>%
+  mutate(library = plyr::mapvalues(x = tumor,
+                                   from = tumor_lib_dict$tumor,
+                                   to = tumor_lib_dict$lib_exp))
+
+ggplot(pc.tibble, aes(x = PC_1, y = PC_2, color = phenotype))+
+  geom_point(size = 3)+
+  theme_bw()+
+  coord_equal()
+
+ggplot(pc.tibble, aes(x = PC_1, y = PC_2, color = library))+
+  geom_point(size = 3)+
+  theme_bw()+
+  coord_equal()
+```
+
+## UMAP of proportion of tumor
+
+```{r}
+library(umap)
+
+config.custom <- umap.defaults
+config.custom$n_neighbors <- 5
+
+npcs <- which.min(as.data.frame(summary(pc.props)$importance)[3,] < 0.95)
+
+umap.props <- umap(d = pc.props$x[,1:npcs],
+                   config = config.custom)
+
+umap.tibble <- as_tibble(umap.props$layout) %>%
+  mutate(tumor = row.names(umap.props$layout)) %>%
+  mutate(phenotype = gsub("[^a-zA-Z]", "", str_split(tumor, pattern = '_', simplify = TRUE)[,1])) %>%
+  mutate(library = plyr::mapvalues(x = tumor,
+                                   from = tumor_lib_dict$tumor,
+                                   to = tumor_lib_dict$lib_exp))
+
+ggplot(umap.tibble, aes(x = V1, y = V2, color = phenotype))+
+  geom_point(size = 3)+
+  theme_bw()+
+  coord_equal()
+
+ggplot(umap.tibble, aes(x = V1, y = V2, color = library))+
+  geom_point(size = 3)+
+  theme_bw()+
+  coord_equal()
+```
+
+# Correlation of all subclusters
+
+```{r, fig.asp = 1}
+# Correlation of clusters
+pd_v_r_sig <- pwc_all %>%
+  filter(group1 == 'PD' & group2 == 'R' & p.adj <= 0.05)
+
+pd_v_v_sig <- pwc_all %>%
+  filter(group1 == 'PD' & group2 == 'V' & p.adj <= 0.05)
+dt_v_v_sig <- pwc_all %>%
+  filter(group1 == 'DT' & group2 == 'V' & p.adj <= 0.05)
+r_v_v_sig <- pwc_all %>%
+  filter(group1 == 'R' & group2 == 'V' & p.adj <= 0.05)
+
+
+cor.props <- cor(props)
+
+col_anno <- data.frame(row.names = row.names(cor.props),
+                       PD_v_R_sig = 1*(row.names(cor.props) %in% pd_v_r_sig$subcluster))
+
+row_anno <- data.frame(row.names = row.names(cor.props),
+                       PD_v_V_sig = 1*(row.names(cor.props) %in% pd_v_v_sig$subcluster),
+                       DT_v_V_sig = 1*(row.names(cor.props) %in% dt_v_v_sig$subcluster),
+                       R_v_V_sig = 1*(row.names(cor.props) %in% r_v_v_sig$subcluster))
+
+pheatmap::pheatmap(cor.props,
+                   cutree_rows = 4,
+                   cutree_cols = 4,
+                   annotation_col = col_anno,
+                   annotation_row = row_anno)
+
+```
+
+
+
+# sessionInfo()
+
+```{r}
+sessionInfo()
+```
+
+
+# 

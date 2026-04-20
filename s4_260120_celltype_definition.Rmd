@@ -1,0 +1,1907 @@
+---
+title: "s4_260120_celltype_definition"
+author: "nlc and zod"
+date: "20/01/2026"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center', out.width = "90%", fig.asp = 1)
+```
+
+<style>
+    body .main-container {
+        max-width: 2160px;
+    }
+</style>
+
+# Experiment & contact info
+
+PIs: Rosalie Sears (searsr@ohsu.edu), Laura Heiser (heiserl@ohsu.edu)
+
+Sample preparation: Zinab Doha (dohaz@ohsu.edu) and (ztoha@taibahu.edu.sa)
+
+Library prep from single cells: Xi Li & Colin Daniel (danielc@ohsu.edu)
+
+Analysis: Nick Calistri (calistri@ohsu.edu)
+
+Sequencing performed by OHSU MPSSR
+
+## Analysis design
+
+- load seurat object
+
+- separate each lineage with multiple clusters (epithelial, stromal, lymphoid, myeloid)
+
+- reprocess within the context of the lineage (varfeatures, scale, dimred, cluster)
+
+- perform DE within each lineage
+
+- Convert cluster to celltype and annotate with relevant pathway/expression 
+
+- Save annotated seurat obejct (s4_so_merge.rds) as well as the lineage subset seurat objects
+
+
+### Object names
+
+epi = epithelial
+sni = stromal non-immune
+lym = lymphoid
+mye = myeloid
+
+# Set up
+
+## Load environment from local project renv
+
+```{r}
+if(!dir.exists('renv')){
+  print('Error - renv library not found')
+}else{
+  print('Loading packages from local renv library')
+  library(renv)
+  renv::load()
+  #reticulate::use_condaenv(condaenv = 'seurat')
+}
+```
+
+
+
+## Load libraries
+```{r}
+library(tidyverse)
+library(Seurat)
+library(harmony)
+library(bluster)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichR)
+# library(UpSetR)
+# library(eulerr)
+```
+
+## load s3_celltypes.rds and create batch variable
+
+```{r}
+so_merge <- readRDS('analysis_files/s3_lineages_250505.rds')
+
+# Consider batch the vial of tubes that was split across two 10X lanes (prefix of library_id)
+
+so_merge@meta.data$batch <- str_split(so_merge@meta.data$library_id,
+                                      pattern = '_',
+                                      simplify = TRUE)[,1]
+
+# Remove any previous clustering attempts
+so_merge@meta.data <- so_merge@meta.data %>%
+  dplyr::select(-grep(colnames(so_merge@meta.data),
+                      pattern = '*snn_res*',
+                      value = TRUE))
+
+```
+
+## Create subset seurat objects
+
+```{r}
+so_epi <- subset(so_merge, subset = lineage == 'epithelial')
+
+so_lym <- subset(so_merge, subset = lineage == 'lymphoid')
+
+so_mye <- subset(so_merge, subset = lineage == 'myeloid')
+
+so_str <- subset(so_merge, subset = lineage == 'stromal')
+
+# Set default ndims
+ndims <- 10
+```
+
+## Prepare subset processing function
+
+```{r}
+process_subset <- function(seurat_object,
+                        ndims = 10,
+                        nVarFeats = 3000){
+  
+  # DefaultAssay(seurat_object) <- 'RNA'
+  # 
+  # seurat_object <- NormalizeData(seurat_object)
+  # seurat_object <- FindVariableFeatures(seurat_object,
+  #                                       nfeatures = nVarFeats)
+  # seurat_object <- ScaleData(seurat_object,
+  #                            vars.to.regress = c('percent.mt', 'percent.ribo'))
+  # 
+  # seurat_object <- RunPCA(seurat_object)
+  # 
+  # # UMAP
+  # seurat_object <- RunUMAP(seurat_object,
+  #                     dims = 1:ndims,
+  #                     n.neighbors = 50)
+  # 
+  # seurat_object <- FindNeighbors(seurat_object,
+  #                                dims = 1:ndims)
+  # 
+  # seurat_object <- CellCycleScoring(seurat_object,
+  #                                 s.features = cc.genes.updated.2019$s.genes,
+  #                                 g2m.features = cc.genes.updated.2019$g2m.genes)
+  
+  # new 05/06/25
+  seurat_object <- SCTransform(seurat_object,
+                               variable.features.n = nVarFeats,
+                               vars.to.regress = c('percent.mt', 'percent.ribo'))
+  
+  seurat_object <- RunPCA(seurat_object)
+  
+  seurat_object <- RunHarmony(seurat_object, group.by.vars = 'batch')
+  
+  seurat_object <- RunUMAP(seurat_object,
+                      dims = 1:ndims,
+                      n.neighbors = 100,
+                      min_dist = 0.5,
+                      reduction = 'harmony')
+  
+  seurat_object <- FindNeighbors(seurat_object,
+                                 dims = 1:ndims,
+                                 reduction = 'harmony')
+  
+  seurat_object <- CellCycleScoring(seurat_object,
+                                  s.features = cc.genes.updated.2019$s.genes,
+                                  g2m.features = cc.genes.updated.2019$g2m.genes)
+  
+  return(seurat_object)
+}
+```
+
+## Prepare harmony subset processing function
+
+```{r}
+process_harmony_subset <- function(seurat_object,
+                        ndims = 10,
+                        nVarFeats = 3000){
+  
+  # Preprocess each batch separately
+  # seurat_object[["RNA"]] <- split(seurat_object, f = seurat_object$batch)
+  # seurat_object <- SCTransform(seurat_object,
+  #                              vars.to.regress = c('percent.mt', 'percent.ribo'))
+  # 
+   DefaultAssay(seurat_object) <- 'SCT'
+
+   seurat_object <- NormalizeData(seurat_object)
+   seurat_object <- FindVariableFeatures(seurat_object)
+   seurat_object <- ScaleData(seurat_object)
+  
+  seurat_object <- RunPCA(seurat_object)
+
+  # Integrate batch with Harmony
+  seurat_object <- IntegrateLayers(object = seurat_object,
+                                   method = HarmonyIntegration,
+                                   orig.reduction = "pca",
+                                   new.reduction = 'harmony',
+                                   verbose = FALSE)
+  
+  # Compute neighborhood and SNN from harmony dimred
+  seurat_object <- RunUMAP(seurat_object,
+                           reduction = 'harmony',
+                           dims = 1:ndims)
+  
+  seurat_object <- FindNeighbors(seurat_object,
+                                 reduction = 'harmony',
+                                 dims = 1:ndims)
+  
+  # Join layers back together
+  seurat_object <- JoinLayers(seurat_object)
+  
+  seurat_object <- PrepSCTFindMarkers(seurat_object)
+  
+  # Run cell cycle scoring  
+  seurat_object <- CellCycleScoring(seurat_object,
+                                    s.features = cc.genes.updated.2019$s.genes,
+                                    g2m.features = cc.genes.updated.2019$g2m.genes)
+  
+  return(seurat_object)
+}
+```
+
+
+## Prepare cluster optimization function
+
+```{r}
+cluster_qc <- function(seurat_object, embedding, ndims = ncol(embedding)){
+  
+  unique_clusterings <- grep(colnames(seurat_object@meta.data),
+                                 pattern = '*_res.',
+                                 value = TRUE)
+  
+  clust_assignments <- seurat_object@meta.data %>%
+    dplyr::select(all_of(unique_clusterings))
+  
+  
+  for(i in 1:ncol(clust_assignments)){
+    
+    curr_resolution <- str_remove(unique_clusterings[i],
+                                  pattern = paste0(DefaultAssay(seurat_object), '_snn_res.')) %>%
+      as.numeric()
+    
+    p1 <- DimPlot(seurat_object,
+                  group.by = unique_clusterings[i],
+                  label = TRUE)+
+      coord_equal()+
+      ggtitle(unique_clusterings[i])
+    
+    print(p1)
+    
+    curr_clusters <- clust_assignments[,i]
+    
+    sil <- approxSilhouette(x = embedding,
+                            clusters = curr_clusters)
+    
+    boxplot(split(sil$width, curr_clusters),
+            main = paste0('Resolution: ', curr_resolution, '\n Mean sil.width: ', mean(sil$width)))
+    
+    best.choice <- ifelse(sil$width > 0,
+                          curr_clusters,
+                          sil$other)
+    
+    table(Assigned=curr_clusters, Closest=best.choice)
+    
+    # 
+    rmsd <- clusterRMSD(embedding, curr_clusters)
+    barplot(rmsd,
+            main = paste0('Resolution: ', curr_resolution, '\n Mean rmsd: ', mean(rmsd)))
+    
+    
+    curr_qc <- tibble(res = curr_resolution,
+                   n_clusters = length(unique(sil$cluster)),
+                   mean_sil_width = mean(sil$width),
+                   mean_rmsd = mean(rmsd))
+    
+    if(i == 1){
+      qc <- curr_qc
+    }else{
+      qc <- rbind(qc, curr_qc)
+    }
+    
+  }
+  return(qc)
+}
+```
+
+## Prepare DEG function
+
+```{r}
+subset_ego <- function(curr_sub, curr_markers){
+
+  if(nrow(curr_markers) > 1){
+    
+    curr_top <- curr_markers %>%
+      filter(avg_log2FC > 0.5) %>%
+      filter(pct.1 > 0.1) %>%
+      group_by(cluster) %>%
+      arrange(desc(avg_log2FC)) %>%
+      filter(p_val_adj <= 0.05) %>%
+      slice_head(n = 5)
+    
+    DoHeatmap(curr_sub, features = curr_top$gene)
+    
+    for(i in sort(unique(curr_markers$cluster))){
+      
+      
+      clust_markers <- curr_markers %>%
+        filter(cluster == i)
+      
+      print(paste0('Evaluating cluster: ', i))
+      
+      volcano_plot <- ggplot(clust_markers, aes(x = avg_log2FC, y = -log10(p_val_adj), label = gene))+
+        geom_point()+
+        ggrepel::geom_text_repel()+
+        ggtitle(paste0('Cluster: ', i))
+      
+      print(volcano_plot)
+      
+      curr_top <- curr_markers %>%
+        filter(cluster == i) %>%
+        filter(avg_log2FC >= 0.5) %>%
+        filter(p_val_adj <= 0.05)
+      
+      curr_bottom <- curr_markers %>%
+        filter(cluster == i) %>%
+        filter(avg_log2FC <= -0.5) %>%
+        filter(p_val_adj <= 0.05)
+      
+      # EnrichR celltype using Azimuth 2023 database
+      er_celltype <- enrichR::enrichr(genes = curr_top$gene,
+                                      databases = 'Azimuth_2023')$Azimuth_2023 %>%
+        mutate(cluster = i)
+      
+      
+      if(if(!is.null(er_celltype)){nrow(er_celltype) > 0}){
+        plotEnrich(er_celltype, showTerms = 20, numChar = 40, y = "Count", orderBy = "P.value")
+      
+        print(head(er_celltype))
+      }
+      
+      # Enrichment of gene ontology
+      ego_top <- enrichGO(gene = curr_top$gene,
+                OrgDb = org.Mm.eg.db,
+                keyType = 'SYMBOL',
+                ont = "ALL",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.01,
+                qvalueCutoff = 0.05)
+  
+      if(if(!is.null(ego_top)){nrow(ego_top) > 0 & nrow(curr_top) >= 3}){
+        ego_top_genelist <- curr_top$avg_log2FC
+        names(ego_top_genelist) <- curr_top$gene
+        ego_top_genelist <- sort(ego_top_genelist, decreasing = TRUE)
+        
+        p1 <- dotplot(ego_top, title = paste0('Cluster ', i))
+        
+        p2 <- cnetplot(ego_top,
+                       showCategory = 10)
+        
+        p3 <- heatplot(ego_top,
+                       showCategory = 10)
+        
+        print(p1)
+        print(p2)
+        print(p3)
+    }else(
+      print('No upregulated GOs found')
+    )
+      
+    
+    }
+      
+  }else{
+    print('FindAllMarkers did not return DEGs (only one cluster in celltype?)')
+  }  
+}
+```
+
+# Epithelial (04/17/26)
+
+## Process epithelial data
+
+##faster
+```{r}
+# Epithelial (05/25/25)
+
+if (file.exists("analysis_files/s4_so_epithelial.rds")) {
+
+  message("Epithelial subset already processed — loading")
+  so_epi <- readRDS("analysis_files/s4_so_epithelial.rds")
+
+} else {
+
+  message("Processing epithelial subset (optimized)")
+
+  DefaultAssay(so_epi) <- "RNA"
+
+  # 1. Normalize (fast)
+  so_epi <- NormalizeData(so_epi, verbose = FALSE)
+
+  # 2. Variable features (LIMITED)
+  so_epi <- FindVariableFeatures(
+    so_epi,
+    selection.method = "vst",
+    nfeatures = 3000,
+    verbose = FALSE
+  )
+
+  # 3. Scale ONLY variable genes (huge speedup)
+  so_epi <- ScaleData(
+    so_epi,
+    features = VariableFeatures(so_epi),
+    verbose = FALSE
+  )
+
+  # 4. PCA (few dims first)
+  so_epi <- RunPCA(
+    so_epi,
+    features = VariableFeatures(so_epi),
+    npcs = 20,
+    verbose = FALSE
+  )
+
+  # 5. Neighbors + clustering (lightweight)
+  so_epi <- FindNeighbors(so_epi, dims = 1:10, verbose = FALSE)
+  so_epi <- FindClusters(so_epi, resolution = 0.4, verbose = FALSE)
+
+  # 6. UMAP (light)
+  so_epi <- RunUMAP(so_epi, dims = 1:10, verbose = FALSE)
+
+  saveRDS(so_epi, "analysis_files/s4_so_epithelial.rds")
+}
+
+```
+
+
+```{r}
+
+ if(file.exists('analysis_files/s4_so_epithelial.rds')){
+   print('Epithelial subset already processed - loading saved file')
+   so_epi <- readRDS('analysis_files/s4_so_epithelial.rds')
+ }else{
+   print('Preprocessed Epithelial seurat object not found, processing now. ETA <5 minutes')
+   so_epi <- process_subset(so_epi,
+                            ndims = 5)
+ }
+
+ElbowPlot(so_epi)
+
+DimPlot(so_epi,
+        group.by = 'phenotype')+
+  coord_equal()+
+  facet_wrap(~phenotype)
+
+DimPlot(so_epi,
+        group.by = 'cluster_l1')+
+  coord_equal()
+
+DimPlot(so_epi,
+        group.by = 'Phase')+
+  coord_equal()
+
+
+```
+
+## Optimize clusters
+
+### Cluster sweep
+
+```{r}
+if(file.exists('analysis_files/s4_so_epithelial.rds')){
+  print('Epithelial subset seurat file already exists, not running cluster optimization')
+}else{
+  
+  # Sweep clusters
+  so_epi <- FindClusters(
+    object = so_epi,
+    resolution = seq(from = 0.05, to = 0.7, by = 0.05),
+    algorithm = 1
+  )
+  
+  ndims <- 10
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_epi,
+                              embedding = so_epi@reductions$harmony@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  best_res <- so_cluster_qc %>%
+    filter(mean_sil_width/mean_rmsd == max(mean_sil_width/mean_rmsd)) %>%
+    dplyr::select(res) %>%
+    pull()
+  
+  p1 <- ggplot(cluster_qc_gathered, aes(x = res, y = value, color = metric))+
+    geom_point()+
+    geom_line()+
+    theme_bw()+
+    facet_wrap(~metric, ncol = 3, scales = 'free_y')+
+    scale_x_continuous(breaks = seq(from = 0, to = 2.5, by = 0.5))+
+    xlab('Louvain resolution')+
+    geom_vline(xintercept = best_res, linetype = 'dashed')
+  
+  p2 <- ggplot(so_cluster_qc, aes(x = mean_sil_width, y = mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  p3 <- ggplot(so_cluster_qc, aes(x = n_clusters, y = mean_sil_width/mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  plot(p1)
+  plot(p2)
+  plot(p3)
+  
+
+}
+
+best_res <- 0.25
+
+```
+
+### Remove swept clusters and set to optimal resolution
+
+```{r, fig.asp = 1}
+# if(file.exists('analysis_files/s4_so_epithelial.rds')){
+#   print('Epithelial subset seurat file already exists, optimizing clustering resolution')
+# }else{
+#   
+#   # Store optimal clustering
+#   so_epi@meta.data$cluster_l2 <- paste0('epi_', so_epi@meta.data[,paste0('RNA_snn_res.', best_res)])
+#   
+#   so_epi@meta.data$seurat_clusters <- so_epi@meta.data$cluster_l2
+#   
+# 
+#   
+#   
+#   
+#   DimPlot(so_epi,
+#           group.by = 'cluster_l2',
+#           label = TRUE)+
+#     coord_equal()+
+#     theme(legend.position = 'none')
+#   
+#   # Remove the remainder
+#   so_epi@meta.data <- so_epi@meta.data %>%
+#     dplyr::select(-grep(colnames(so_epi@meta.data),
+#                         pattern = '*snn_res*',
+#                         value = TRUE))
+# 
+#   # Save processed object
+#   saveRDS(so_epi, file = 'analysis_files/s4_so_epithelial.rds')
+# }
+# 
+# # Visualize optimal sub
+# 
+# DimPlot(so_epi,
+#         group.by = 'cluster_l2',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# # Overlap
+# 
+# cluster_overlap <- so_epi@meta.data %>%
+#   dplyr::select(cluster_l1, cluster_l2) %>%
+#   table()
+# 
+# epi_nmi <- aricode::NMI(c1 = so_epi@meta.data$cluster_l1,
+#                         c2 = so_epi@meta.data$cluster_l2)
+```
+
+
+```{r}
+# Store optimal clustering (ALWAYS)
+so_epi$cluster_l2 <- paste0(
+  "epi_",
+  so_epi@meta.data[[paste0("RNA_snn_res.", best_res)]]
+)
+
+so_epi$seurat_clusters <- so_epi$cluster_l2
+Idents(so_epi) <- "cluster_l2"
+
+
+DimPlot(
+  so_epi,
+  group.by = "cluster_l2",
+  label = TRUE
+) +
+  coord_equal() +
+  theme(legend.position = "none")
+
+
+# Overlap
+
+cluster_overlap <- so_epi@meta.data %>%
+  dplyr::select(cluster_l1, cluster_l2) %>%
+  table()
+
+epi_nmi <- aricode::NMI(c1 = so_epi@meta.data$cluster_l1,
+                        c2 = so_epi@meta.data$cluster_l2)
+
+#saveRDS(so_epi, "analysis_files/s4_so_epithelial.rds")
+
+
+```
+
+### Visualize cluster similarity (PCA embedding and variable feature correlation heatmaps)
+
+```{r}
+# Average PCA embedding to show relationship to cluster, annotated by lineage
+cluster_embedding <- tibble(cluster_l2 = so_epi@meta.data$cluster_l2) %>%
+  cbind(so_epi@reductions$pca@cell.embeddings) %>%
+  group_by(cluster_l2) %>%
+  summarize(across(everything(), list(mean)))
+
+pheatmap::pheatmap(data.frame(cluster_embedding[,2:(ndims + 1)],
+                              row.names = cluster_embedding$cluster_l2),
+                   main = 'Average pca embedding per cluster \n column z-scored',
+                   breaks = seq(from = -5, to = 5, length.out = 100))
+
+# Correlation heatmap
+
+Idents(so_epi) <- 'cluster_l2'
+
+av.exp <- AverageExpression(so_epi)$RNA[VariableFeatures(so_epi),]
+cor.exp <- as.data.frame(cor(as.matrix(av.exp), method = 'pearson'))
+
+pheatmap::pheatmap(cor.exp)
+```
+
+
+## Differential expression and Enrichment of Gene Ontology
+
+### Find DEGs from subclusters
+```{r}
+so_epi <- JoinLayers(so_epi)
+
+```
+
+
+```{r}
+if(file.exists('analysis_files/s4_epithelial_markers.csv')){
+  print('Epithelial marker csv loading')
+  epi_markers <- read_csv('analysis_files/s4_epithelial_markers.csv')
+}else{
+  print('Computing Epithelial markers then saving')
+  Idents(so_epi) <- 'cluster_l2'
+  epi_markers <- FindAllMarkers(so_epi,
+                                only.pos = TRUE)
+  
+  write_csv(epi_markers, 'analysis_files/s4_epithelial_markers.csv')
+}
+
+
+```
+
+
+
+### Visualize top DEGs
+
+```{r, fig.asp = 1}
+epi_top <- epi_markers %>%
+  group_by(cluster) %>%
+  filter(p_val_adj <= 0.01) %>%
+  filter(pct.1 > 0.25) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5)
+
+so_epi <- ScaleData(so_epi,
+                    features = unique(epi_top$gene))
+
+# Heatmap of top markers
+DoHeatmap(so_epi,
+          features = unique(epi_top$gene))
+
+DotPlot(so_epi,
+        features = unique(epi_top$gene),
+        cols = 'RdYlBu')+
+  coord_flip()+
+  RotatedAxis()
+```
+
+## EGO
+
+```{r}
+subset_ego(curr_sub = so_epi,
+           curr_markers = epi_markers)
+```
+
+
+## Define epithelial subtype annotations based on EGO + marker analysis
+```{r}
+# Define epithelial subtype annotations based on EGO + marker analysis
+epi_annotations <- c(
+  "epi_0" = "angiogenesis_regulation",
+  "epi_1" = "oxphos ",
+  "epi_2" = "epiderms_development",
+  "epi_3" = "gland_development",
+  "epi_4" = "Tcell_activation",
+  "epi_5" = "myeloid_chemotaxis",
+  "epi_6" = "proliferative",
+  "epi_7" = "myeloid_chemotaxis",
+  "epi_8"= "proliferative",
+  "epi_9"= "ECM_modulation",
+  "epi_10" = "fatty_acid_metabolism"
+  # adjust cluster IDs and names based on your EGO results
+)
+
+# Assign annotations to Seurat object
+so_epi$epi_subtype <- dplyr::recode(
+  as.character(so_epi$seurat_clusters),
+  !!!epi_annotations
+)
+
+# Set as identity
+Idents(so_epi) <- "epi_subtype"
+
+# Verify
+table(so_epi$epi_subtype)
+
+# Visualize
+DimPlot(so_epi,
+        group.by = "epi_subtype",
+        label = FALSE,
+        repel = TRUE) +
+  ggtitle("Epithelial Subtypes")
+```
+
+```{r}
+# ── Global phenotype palette (run once at the top of your script) ─────────────
+phenotype_colors <- c(
+  "PD" = "#7CAE00",   # Combo
+  "R"  = "#F8766D",   # PARPI_R
+  "S"  = "#00A9FF",   # PARPI_S
+  "DT" = "#C77CFF",   # PP2A
+  "V"  = "#666666"    # Vehicle
+)
+
+phenotype_labels <- c(
+  "PD" = "Combo",
+  "R"  = "PARPI_R",
+  "S"  = "PARPI_S",
+  "DT" = "PP2A",
+  "V"  = "Vehicle"
+)
+```
+
+
+```{r}
+so_meta_epi <- so_epi@meta.data
+
+so_meta_tumors_epi <- so_meta_epi %>%
+  dplyr::select(epi_subtype, phenotype, tumor) %>%
+  group_by(tumor, epi_subtype, phenotype) %>%
+  summarize(n_cells = n(), .groups = "drop") %>%
+  group_by(tumor) %>%
+  mutate(freq = n_cells / sum(n_cells))
+
+so_meta_tumors_summary_epi <- so_meta_tumors_epi %>%
+  group_by(phenotype, epi_subtype) %>%
+  summarize(
+    tumor_count   = n(),
+    mean_freq     = mean(freq),
+    freq_sd_ymin  = mean(freq) - sd(freq),
+    freq_sd_ymax  = mean(freq) + sd(freq),
+    freq_sem_ymin = mean(freq) - sd(freq) / (tumor_count)^0.5,
+    freq_sem_ymax = mean(freq) + sd(freq) / (tumor_count)^0.5,
+    .groups = "drop"
+  )
+
+ggplot(so_meta_tumors_summary_epi,
+       aes(x = epi_subtype, y = mean_freq, fill = phenotype)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = freq_sem_ymin, ymax = freq_sem_ymax),
+                position = "dodge", width = 0.5) +
+  facet_grid(rows = vars(phenotype),
+             scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = phenotype_colors, labels = phenotype_labels) +
+  theme_bw() +
+  theme(strip.text.y.right = element_text(angle = 0)) +
+  xlab("Epithelial Subtype") +
+  ylab("Mean frequency") +
+  RotatedAxis()
+```
+
+
+# Lymphoid (04/17/26)
+
+## Process lymphoid data
+
+
+##faster
+```{r}
+# so_lym (04/17/26)
+
+if (file.exists("analysis_files/s4_so_lymphoid.rds")) {
+
+  message("lymphoid subset already processed — loading")
+  so_lym <- readRDS("analysis_files/s4_so_lymphoid.rds")
+
+} else {
+
+  message("Processing lymphoid subset (optimized)")
+
+  DefaultAssay(so_lym) <- "RNA"
+
+  # 1. Normalize (fast)
+  so_lym <- NormalizeData(so_lym, verbose = FALSE)
+
+  # 2. Variable features (LIMITED)
+  so_lym <- FindVariableFeatures(
+    so_lym,
+    selection.method = "vst",
+    nfeatures = 3000,
+    verbose = FALSE
+  )
+
+  # 3. Scale ONLY variable genes (huge speedup)
+  so_lym <- ScaleData(
+    so_lym,
+    features = VariableFeatures(so_lym),
+    verbose = FALSE
+  )
+
+  # 4. PCA (few dims first)
+  so_lym <- RunPCA(
+    so_lym,
+    features = VariableFeatures(so_lym),
+    npcs = 20,
+    verbose = FALSE
+  )
+
+  # 5. Neighbors + clustering (lightweight)
+  so_lym <- FindNeighbors(so_lym, dims = 1:10, verbose = FALSE)
+  so_lym <- FindClusters(so_lym, resolution = 0.4, verbose = FALSE)
+
+  # 6. UMAP (light)
+  so_lym <- RunUMAP(so_lym, dims = 1:10, verbose = FALSE)
+
+  saveRDS(so_lym, "analysis_files/s4_so_lymphoid.rds")
+}
+
+```
+
+- Load from saved RDS if it exists
+- Else: Process subset with 10 PCs
+
+```{r, fig.asp = 1}
+
+if(file.exists('analysis_files/s4_so_lymphoid.rds')){
+  print('lymphoid subset already processed - loading saved file')
+  so_lym <- readRDS('analysis_files/s4_so_lymphoid.rds')
+}else{
+  print('Preprocessed lymphoid seurat object not found, processing now. ETA <5 minutes')
+  so_lym <- process_subset(so_lym)
+}
+
+ElbowPlot(so_lym)
+
+DimPlot(so_lym,
+        group.by = 'phenotype')+
+  coord_equal()+
+  facet_wrap(~phenotype)
+
+DimPlot(so_lym,
+        group.by = 'cluster_l1')+
+  coord_equal()
+
+# DimPlot(so_lym,
+#         group.by = 'Phase')+
+#   coord_equal()
+
+```
+
+## Optimize clusters
+
+### Cluster sweep
+```{r}
+if(file.exists('analysis_files/s4_so_lymphoid.rds')){
+  print('lymphoid subset seurat file already exists, not running cluster optimization')
+}else{
+
+  so_lym <- FindClusters(
+    object = so_lym,
+    resolution = seq(from = 0.05, to = 1, by = 0.05),
+    algorithm = 3
+  )
+  
+  ndims <- 10
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_lym,
+                              embedding = so_lym@reductions$pca@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  best_res <- so_cluster_qc %>%
+    filter(mean_sil_width/mean_rmsd == max(mean_sil_width/mean_rmsd)) %>%
+    dplyr::select(res) %>%
+    pull()
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_lym,
+                              embedding = so_lym@reductions$pca@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  p1 <- ggplot(cluster_qc_gathered, aes(x = res, y = value, color = metric))+
+    geom_point()+
+    geom_line()+
+    theme_bw()+
+    facet_wrap(~metric, ncol = 3, scales = 'free_y')+
+    scale_x_continuous(breaks = seq(from = 0, to = 2.5, by = 0.5))+
+    xlab('Louvain resolution')+
+    geom_vline(xintercept = best_res, linetype = 'dashed')
+  
+  p2 <- ggplot(so_cluster_qc, aes(x = mean_sil_width, y = mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  p3 <- ggplot(so_cluster_qc, aes(x = n_clusters, y = mean_sil_width/mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  plot(p1)
+  plot(p2)
+  plot(p3)
+}
+
+```
+
+### Remove swept clusters and set to optimal resolution
+
+```{r, fig.asp = 1}
+# best_res <- 0.1
+# 
+# if(file.exists('analysis_files/s4_so_lymphoid.rds')){
+#   print('lymphoid subset seurat file already exists, optimizing clustering resolution')
+# }else{
+#  # Store optimal clustering
+#   so_lym@meta.data$cluster_l2 <- paste0('lym_', so_lym@meta.data[,paste0('RNA_snn_res.', best_res)])
+#   
+#   so_lym@meta.data$seurat_clusters <- so_lym@meta.data$cluster_l2
+#   
+#   DimPlot(so_lym,
+#           group.by = 'cluster_l2',
+#           label = TRUE)+
+#     coord_equal()+
+#     theme(legend.position = 'none')
+#   
+#   # Remove the remainder
+#   so_lym@meta.data <- so_lym@meta.data %>%
+#     dplyr::select(-grep(colnames(so_lym@meta.data),
+#                         pattern = '^SCT_snn_res*',
+#                         value = TRUE))
+#   
+#   # Save processed object
+#   saveRDS(so_lym, file = 'analysis_files/s4_so_lymphoid.rds')
+# }
+# 
+# # Visualize optimal sub
+# 
+# DimPlot(so_lym,
+#         group.by = 'cluster_l2',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# DimPlot(so_lym,
+#         group.by = 'phenotype',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# # Overlap
+# 
+# cluster_overlap <- so_lym@meta.data %>%
+#   dplyr::select(cluster_l1, cluster_l2) %>%
+#   table()
+# 
+# lym_nmi <- aricode::NMI(c1 = so_lym@meta.data$cluster_l1,
+#              c2 = so_lym@meta.data$cluster_l2)
+# 
+# pheatmap::pheatmap(cluster_overlap,
+#                    display_numbers = round(cluster_overlap),
+#                    main = paste0('lymphoid sub/clustering overlap \n NMI = ', round(lym_nmi,2)))
+```
+
+```{r}
+best_res <- 0.1
+
+# Store optimal clustering (ALWAYS)
+so_lym$cluster_l2 <- paste0(
+  "lym_",
+ so_lym@meta.data[[paste0("RNA_snn_res.", best_res)]]
+)
+
+so_lym$seurat_clusters <- so_lym$cluster_l2
+Idents(so_lym) <- "cluster_l2"
+
+
+DimPlot(
+  so_lym,
+  group.by = "cluster_l2",
+  label = TRUE
+) +
+  coord_equal() +
+  theme(legend.position = "none")
+
+
+# Overlap
+
+cluster_overlap <- so_lym@meta.data %>%
+  dplyr::select(cluster_l1, cluster_l2) %>%
+  table()
+
+epi_nmi <- aricode::NMI(c1 = so_lym@meta.data$cluster_l1,
+                        c2 = so_lym@meta.data$cluster_l2)
+
+saveRDS(so_lym, "analysis_files/s4_so_lymphoid.rds")
+```
+
+
+
+### Visualize cluster similarity (PCA embedding and correlation heatmaps)
+
+```{r}
+# Average pca embedding to show relationship to cluster, annotated by lineage
+cluster_embedding <- tibble(cluster_l2 = so_lym@meta.data$cluster_l2) %>%
+  cbind(so_lym@reductions$pca@cell.embeddings) %>%
+  group_by(cluster_l2) %>%
+  summarize(across(everything(), list(mean)))
+
+pheatmap::pheatmap(data.frame(cluster_embedding[,2:(ndims+1)],
+                              row.names = cluster_embedding$cluster_l2),
+                   main = 'Average pca embedding per cluster \n column z-scored')
+
+# Correlation heatmap
+
+Idents(so_lym) <- 'cluster_l2'
+
+av.exp <- AverageExpression(so_lym)$RNA[VariableFeatures(so_lym),]
+cor.exp <- as.data.frame(cor(as.matrix(av.exp), method = 'pearson'))
+
+pheatmap::pheatmap(cor.exp)
+```
+
+
+## Differential expression and Enrichment of Gene Ontology
+
+### Find DEGs from subclusters
+
+```{r}
+if(file.exists('analysis_files/s4_lymphoid_markers.csv')){
+  print('lymphoid marker csv loading')
+  lym_markers <- read_csv('analysis_files/s4_lymphoid_markers.csv')
+}else{
+  print('Computing lymphoid markers then saving')
+  Idents(so_lym) <- 'cluster_l2'
+  lym_markers <- FindAllMarkers(so_lym,
+                                only.pos = TRUE)
+  
+  write_csv(lym_markers, 'analysis_files/s4_lymphoid_markers.csv')
+}
+
+
+```
+
+### Visualize top DEGs
+
+```{r, fig.asp = 1}
+lym_top <- lym_markers %>%
+  group_by(cluster) %>%
+  filter(pct.1 > 0.2) %>%
+  filter(p_val_adj <= 0.01) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5)
+
+so_lym <- ScaleData(so_lym,
+                    features = unique(lym_top$gene))
+
+# Heatmap of top markers
+DoHeatmap(so_lym,
+          features = unique(lym_top$gene))
+
+DotPlot(so_lym,
+        features = unique(lym_top$gene),
+        cols = 'RdYlBu')+
+  coord_flip()+
+  RotatedAxis()
+```
+
+## EGO
+
+```{r}
+subset_ego(curr_sub = so_lym,
+           curr_markers = lym_markers)
+```
+
+# Myeloid 
+
+## Process myeloid data
+##faster
+```{r}
+# so_mye (04/17/26)
+
+if (file.exists("analysis_files/s4_so_myeloid.rds")) {
+
+  message("myeloid subset already processed — loading")
+  so_mye <- readRDS("analysis_files/s4_so_myeloid.rds")
+
+} else {
+
+  message("Processing myeloid subset (optimized)")
+
+  DefaultAssay(so_mye) <- "RNA"
+
+  # 1. Normalize (fast)
+  so_mye <- NormalizeData(so_mye, verbose = FALSE)
+
+  # 2. Variable features (LIMITED)
+  so_mye <- FindVariableFeatures(
+    so_mye,
+    selection.method = "vst",
+    nfeatures = 3000,
+    verbose = FALSE
+  )
+
+  # 3. Scale ONLY variable genes (huge speedup)
+  so_mye <- ScaleData(
+    so_mye,
+    features = VariableFeatures(so_mye),
+    verbose = FALSE
+  )
+
+  # 4. PCA (few dims first)
+  so_mye <- RunPCA(
+    so_mye,
+    features = VariableFeatures(so_mye),
+    npcs = 20,
+    verbose = FALSE
+  )
+
+  # 5. Neighbors + clustering (lightweight)
+  so_mye <- FindNeighbors(so_mye, dims = 1:10, verbose = FALSE)
+ so_mye <- FindClusters(so_mye, resolution = 0.4, verbose = FALSE)
+
+  # 6. UMAP (light)
+ so_mye <- RunUMAP(so_mye, dims = 1:10, verbose = FALSE)
+
+  saveRDS(so_mye, "analysis_files/s4_so_myeloid.rds")
+}
+
+```
+
+- Load from saved RDS if it exists
+- Else: Process subset with 10 PCs
+
+```{r}
+
+if(file.exists('analysis_files/s4_so_myeloid.rds')){
+  print('myeloid subset already processed - loading saved file')
+  so_mye <- readRDS('analysis_files/s4_so_myeloid.rds')
+}else{
+  print('Preprocessed myeloid seurat object not found, processing now. ETA <5 minutes')
+  so_mye <- process_subset(so_mye)
+}
+
+ElbowPlot(so_mye)
+
+DimPlot(so_mye,
+        group.by = 'phenotype')+
+  coord_equal()+
+  facet_wrap(~phenotype)
+
+DimPlot(so_mye,
+        group.by = 'cluster_l1')+
+  coord_equal()
+
+# DimPlot(so_mye,
+#         group.by = 'Phase')+
+#   coord_equal()
+```
+
+## Optimize clusters
+
+### Cluster sweep
+```{r}
+if(file.exists('analysis_files/s4_so_myeloid.rds')){
+  print('myeloid subset seurat file already exists, not running cluster optimization')
+}else{
+
+  so_mye <- FindClusters(
+    object = so_mye,
+    resolution = seq(from = 0.05, to = 0.7, by = 0.05),
+    algorithm = 3
+  )
+  
+  ndims <- 10
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_mye,
+                              embedding = so_mye@reductions$pca@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  best_res <- so_cluster_qc %>%
+    filter(mean_sil_width/mean_rmsd == max(mean_sil_width/mean_rmsd)) %>%
+    dplyr::select(res) %>%
+    pull()
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_mye,
+                              embedding = so_mye@reductions$pca@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  p1 <- ggplot(cluster_qc_gathered, aes(x = res, y = value, color = metric))+
+    geom_point()+
+    geom_line()+
+    theme_bw()+
+    facet_wrap(~metric, ncol = 3, scales = 'free_y')+
+    scale_x_continuous(breaks = seq(from = 0, to = 2.5, by = 0.5))+
+    xlab('Louvain resolution')+
+    geom_vline(xintercept = best_res, linetype = 'dashed')
+  
+  p2 <- ggplot(so_cluster_qc, aes(x = mean_sil_width, y = mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  p3 <- ggplot(so_cluster_qc, aes(x = n_clusters, y = mean_sil_width/mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  plot(p1)
+  plot(p2)
+  plot(p3)
+}
+
+# Override best_res due to prior biological knowledge
+
+best_res <- 0.1
+```
+
+### Remove swept clusters and set to optimal resolution
+
+```{r, fig.asp = 1}
+# if(file.exists('analysis_files/s4_so_myeloid.rds')){
+#   print('myeloid subset seurat file already exists, optimizing clustering resolution')
+# }else{
+#  # Store optimal clustering
+#   so_mye@meta.data$cluster_l2 <- paste0('mye_', so_mye@meta.data[,paste0('SCT_snn_res.', best_res)])
+#   
+#   so_mye@meta.data$seurat_clusters <- so_mye@meta.data$cluster_l2
+#   
+#   DimPlot(so_mye,
+#           group.by = 'cluster_l2',
+#           label = TRUE)+
+#     coord_equal()+
+#     theme(legend.position = 'none')
+#   
+#   # Remove the remainder
+#   so_mye@meta.data <- so_mye@meta.data %>%
+#     dplyr::select(-grep(colnames(so_mye@meta.data),
+#                         pattern = '*snn_res*',
+#                         value = TRUE))
+#   
+#   # Save processed object
+#   saveRDS(so_mye, file = 'analysis_files/s4_so_myeloid.rds')
+# }
+# 
+# # Visualize optimal sub
+# 
+# DimPlot(so_mye,
+#         group.by = 'cluster_l2',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# DimPlot(so_mye,
+#         group.by = 'phenotype',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# # Overlap
+# 
+# cluster_overlap <- so_mye@meta.data %>%
+#   dplyr::select(cluster_l1, cluster_l2) %>%
+#   table()
+# 
+# mye_nmi <- aricode::NMI(c1 = so_mye@meta.data$cluster_l1,
+#              c2 = so_mye@meta.data$cluster_l2)
+# 
+# pheatmap::pheatmap(cluster_overlap,
+#                    display_numbers = round(cluster_overlap),
+#                    main = paste0('myeloid sub/clustering overlap \n NMI = ', round(mye_nmi,2)))
+```
+
+```{r}
+best_res <- 0.1
+
+# Store optimal clustering (ALWAYS)
+so_mye$cluster_l2 <- paste0(
+  "mye_",
+ so_mye@meta.data[[paste0("RNA_snn_res.", best_res)]]
+)
+
+so_mye$seurat_clusters <- so_mye$cluster_l2
+Idents(so_mye) <- "cluster_l2"
+
+
+DimPlot(
+  so_mye,
+  group.by = "cluster_l2",
+  label = TRUE
+) +
+  coord_equal() +
+  theme(legend.position = "none")
+
+
+# Overlap
+
+cluster_overlap <- so_mye@meta.data %>%
+  dplyr::select(cluster_l1, cluster_l2) %>%
+  table()
+
+mye_nmi <- aricode::NMI(c1 = so_mye@meta.data$cluster_l1,
+                        c2 = so_mye@meta.data$cluster_l2)
+
+saveRDS(so_mye, "analysis_files/s4_so_myeloid.rds")
+```
+
+### Visualize cluster similarity (PCA embedding and correlation heatmaps)
+
+```{r}
+# Average pca embedding to show relationship to cluster, annotated by lineage
+cluster_embedding <- tibble(cluster_l2 = so_mye@meta.data$cluster_l2) %>%
+  cbind(so_mye@reductions$pca@cell.embeddings) %>%
+  group_by(cluster_l2) %>%
+  summarize(across(everything(), list(mean)))
+
+pheatmap::pheatmap(data.frame(cluster_embedding[,2:(ndims+1)],
+                              row.names = cluster_embedding$cluster_l2),
+                   main = 'Average pca embedding per cluster \n column z-scored')
+
+# Correlation heatmap
+
+Idents(so_mye) <- 'cluster_l2'
+
+av.exp <- AverageExpression(so_mye)$RNA[VariableFeatures(so_mye),]
+cor.exp <- as.data.frame(cor(as.matrix(av.exp), method = 'pearson'))
+
+pheatmap::pheatmap(cor.exp)
+```
+
+## Differential expression and Enrichment of Gene Ontology
+
+### Find DEGs from subclusters
+
+```{r}
+if(file.exists('analysis_files/s4_myeloid_markers.csv')){
+  print('Myeloid marker csv loading')
+  mye_markers <- read_csv('analysis_files/s4_myeloid_markers.csv')
+}else{
+  print('Computing Myeloid markers then saving')
+  Idents(so_mye) <- 'cluster_l2'
+  mye_markers <- FindAllMarkers(so_mye,
+                                only.pos = TRUE)
+  
+  write_csv(mye_markers, 'analysis_files/s4_myeloid_markers.csv')
+}
+
+
+```
+
+### Visualize top DEGs
+
+```{r, fig.asp = 1}
+mye_top <- mye_markers %>%
+  group_by(cluster) %>%
+  filter(pct.1 > 0.2) %>%
+  filter(p_val_adj <= 0.01) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 3)
+
+so_mye <- ScaleData(so_mye,
+                    features = unique(mye_top$gene))
+
+# Heatmap of top markers
+DoHeatmap(so_mye,
+          features = unique(mye_top$gene))
+
+DotPlot(so_mye,
+        features = unique(mye_top$gene),
+        cols = 'RdYlBu')+
+  coord_flip()+
+  RotatedAxis()
+```
+
+
+## EGO
+
+```{r}
+subset_ego(curr_sub = so_mye,
+           curr_markers = mye_markers)
+```
+
+# Stroma (04/17/26)
+
+## Process stroma data
+
+- Load from saved RDS if it exists
+- Else: Process subset with 10 PCs
+##faster
+```{r}
+# so_str (04/17/26)
+
+if (file.exists("analysis_files/s4_so_stromal.rds")) {
+
+  message("stromal subset already processed — loading")
+  so_str <- readRDS("analysis_files/s4_so_stromal.rds")
+
+} else {
+
+  message("Processing stromal subset (optimized)")
+
+  DefaultAssay(so_str) <- "RNA"
+
+  # 1. Normalize (fast)
+  so_str <- NormalizeData(so_str, verbose = FALSE)
+
+  # 2. Variable features (LIMITED)
+  so_str <- FindVariableFeatures(
+    so_str,
+    selection.method = "vst",
+    nfeatures = 3000,
+    verbose = FALSE
+  )
+
+  # 3. Scale ONLY variable genes (huge speedup)
+  so_str <- ScaleData(
+    so_str,
+    features = VariableFeatures(so_str),
+    verbose = FALSE
+  )
+
+  # 4. PCA (few dims first)
+  so_str <- RunPCA(
+    so_str,
+    features = VariableFeatures(so_str),
+    npcs = 20,
+    verbose = FALSE
+  )
+
+  # 5. Neighbors + clustering (lightweight)
+  so_str <- FindNeighbors(so_str, dims = 1:10, verbose = FALSE)
+ so_str <- FindClusters(so_str, resolution = 0.4, verbose = FALSE)
+
+  # 6. UMAP (light)
+ so_str <- RunUMAP(so_str, dims = 1:10, verbose = FALSE)
+
+  saveRDS(so_str, "analysis_files/s4_so_stromal.rds")
+}
+
+```
+
+```{r}
+
+if(file.exists('analysis_files/s4_so_stromal.rds')){
+  print('stromal subset already processed - loading saved file')
+  so_str <- readRDS('analysis_files/s4_so_stromal.rds')
+}else{
+  print('Preprocessed stromal seurat object not found, processing now. ETA <5 minutes')
+  so_str <- process_subset(so_str)
+}
+
+ElbowPlot(so_str)
+
+DimPlot(so_str,
+        group.by = 'phenotype')+
+  coord_equal()+
+  facet_wrap(~phenotype)
+
+DimPlot(so_str,
+        group.by = 'cluster_l1')+
+  coord_equal()
+
+# DimPlot(so_str,
+#         group.by = 'Phase')+
+#   coord_equal()
+```
+
+## Optimize clusters
+
+### Cluster sweep
+```{r}
+if(file.exists('analysis_files/s4_so_stromal.rds')){
+  print('stromal subset seurat file already exists, not running cluster optimization')
+}else{
+
+  so_str <- FindClusters(
+    object = so_str,
+    resolution = seq(from = 0.05, to = 0.7, by = 0.05),
+    algorithm = 3
+  )
+  
+  ndims <- 10
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_str,
+                              embedding = so_str@reductions$pca@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  best_res <- so_cluster_qc %>%
+    filter(mean_sil_width/mean_rmsd == max(mean_sil_width/mean_rmsd)) %>%
+    dplyr::select(res) %>%
+    pull()
+  
+  so_cluster_qc <- cluster_qc(seurat_object = so_str,
+                              embedding = so_str@reductions$pca@cell.embeddings[,1:ndims])
+  
+  cluster_qc_gathered <- so_cluster_qc %>%
+    gather(- c(res), value = 'value', key = 'metric')
+  
+  p1 <- ggplot(cluster_qc_gathered, aes(x = res, y = value, color = metric))+
+    geom_point()+
+    geom_line()+
+    theme_bw()+
+    facet_wrap(~metric, ncol = 3, scales = 'free_y')+
+    scale_x_continuous(breaks = seq(from = 0, to = 2.5, by = 0.5))+
+    xlab('Louvain resolution')+
+    geom_vline(xintercept = best_res, linetype = 'dashed')
+  
+  p2 <- ggplot(so_cluster_qc, aes(x = mean_sil_width, y = mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  p3 <- ggplot(so_cluster_qc, aes(x = n_clusters, y = mean_sil_width/mean_rmsd, label = res, color = n_clusters))+
+    geom_point()+
+    ggrepel::geom_text_repel()+
+    theme_bw()
+  
+  plot(p1)
+  plot(p2)
+  plot(p3)
+}
+
+```
+
+### Remove swept clusters and set to optimal resolution
+
+```{r, fig.asp = 1}
+# if(file.exists('analysis_files/s4_so_stromal.rds')){
+#   print('stromal subset seurat file already exists, optimizing clustering resolution')
+# }else{
+#  # Store optimal clustering
+#   so_str@meta.data$cluster_l2 <- paste0('str_', so_str@meta.data[,paste0('SCT_snn_res.', best_res)])
+#   
+#   so_str@meta.data$seurat_clusters <- so_str@meta.data$cluster_l2
+#   
+#   DimPlot(so_str,
+#           group.by = 'cluster_l2',
+#           label = TRUE)+
+#     coord_equal()+
+#     theme(legend.position = 'none')
+#   
+#   # Remove the remainder
+#   so_str@meta.data <- so_str@meta.data %>%
+#     dplyr::select(-grep(colnames(so_str@meta.data),
+#                         pattern = '*snn_res*',
+#                         value = TRUE))
+#   
+#   # Save processed object
+#   saveRDS(so_str, file = 'analysis_files/s4_so_stromal.rds')
+# }
+# 
+# # Visualize optimal sub
+# 
+# DimPlot(so_str,
+#         group.by = 'cluster_l2',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# DimPlot(so_str,
+#         group.by = 'phenotype',
+#         label = TRUE)+
+#   coord_equal()
+# 
+# # Overlap
+# 
+# cluster_overlap <- so_str@meta.data %>%
+#   dplyr::select(cluster_l1, cluster_l2) %>%
+#   table()
+# 
+# str_nmi <- aricode::NMI(c1 = so_str@meta.data$cluster_l1,
+#              c2 = so_str@meta.data$cluster_l2)
+# 
+# pheatmap::pheatmap(cluster_overlap,
+#                    display_numbers = round(cluster_overlap),
+#                    main = paste0('stromal sub/clustering overlap \n NMI = ', round(str_nmi,2)))
+```
+
+```{r}
+best_res <- 0.1
+
+# Store optimal clustering (ALWAYS)
+so_str$cluster_l2 <- paste0(
+  "mye_",
+ so_str@meta.data[[paste0("RNA_snn_res.", best_res)]]
+)
+
+so_str$seurat_clusters <- so_str$cluster_l2
+Idents(so_str) <- "cluster_l2"
+
+
+DimPlot(
+  so_str,
+  group.by = "cluster_l2",
+  label = TRUE
+) +
+  coord_equal() +
+  theme(legend.position = "none")
+
+
+# Overlap
+
+cluster_overlap <- so_str@meta.data %>%
+  dplyr::select(cluster_l1, cluster_l2) %>%
+  table()
+
+str_nmi <- aricode::NMI(c1 = so_str@meta.data$cluster_l1,
+                        c2 = so_str@meta.data$cluster_l2)
+
+saveRDS(so_str, "analysis_files/s4_so_stromal00.rds")
+```
+
+
+### Visualize cluster similarity (PCA embedding and correlation heatmaps)
+
+```{r}
+# Average pca embedding to show relationship to cluster, annotated by lineage
+cluster_embedding <- tibble(cluster_l2 = so_str@meta.data$cluster_l2) %>%
+  cbind(so_str@reductions$pca@cell.embeddings) %>%
+  group_by(cluster_l2) %>%
+  summarize(across(everything(), list(mean)))
+
+pheatmap::pheatmap(data.frame(cluster_embedding[,2:(ndims+1)],
+                              row.names = cluster_embedding$cluster_l2),
+                   main = 'Average pca embedding per cluster \n column z-scored')
+
+# Correlation heatmap
+
+Idents(so_str) <- 'cluster_l2'
+
+av.exp <- AverageExpression(so_str)$RNA[VariableFeatures(so_str),]
+cor.exp <- as.data.frame(cor(as.matrix(av.exp), method = 'pearson'))
+
+pheatmap::pheatmap(cor.exp)
+```
+
+## Differential expression and Enrichment of Gene Ontology
+
+### Find DEGs from subclusters
+
+```{r}
+if(file.exists('analysis_files/s4_stromal_markers.csv')){
+  print('stromal marker csv loading')
+  str_markers <- read_csv('analysis_files/s4_stromal_markers.csv')
+}else{
+  print('Computing stromal markers then saving')
+  Idents(so_str) <- 'cluster_l2'
+  str_markers <- FindAllMarkers(so_str,
+                                only.pos = TRUE)
+  
+  write_csv(str_markers, 'analysis_files/s4_stromal_markers.csv')
+}
+
+
+```
+
+### Visualize top DEGs
+
+```{r, fig.asp = 1}
+str_top <- str_markers %>%
+  group_by(cluster) %>%
+  filter(pct.1 > 0.2) %>%
+  filter(p_val_adj <= 0.01) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5)
+
+so_str <- ScaleData(so_str,
+                    features = unique(str_top$gene))
+
+# Heatmap of top markers
+DoHeatmap(so_str,
+          features = unique(str_top$gene))
+
+DotPlot(so_str,
+        features = unique(str_top$gene),
+        cols = 'RdYlBu')+
+  coord_flip()+
+  RotatedAxis()
+```
+
+## EGO
+
+```{r}
+subset_ego(curr_sub = so_str,
+           curr_markers = str_markers)
+```
+
+
+# Canonical marker investigation
+
+## Cytokeratin profile of epithelial clusters
+
+```{r, fig.asp = 1, eval = FALSE}
+keratin_features <- grep(row.names(so_epi), pattern = '^Krt', value = TRUE)
+
+keratin_aves <- AverageExpression(so_epi,
+                                  features = keratin_features,
+                                  assay = 'RNA')
+
+keratin_aves_filtered <- keratin_aves$RNA[rowSums(keratin_aves$RNA) != 0,]
+keratin_aves_top <- keratin_aves$RNA[rowSums(keratin_aves$RNA) >= quantile(rowSums(keratin_aves$RNA), 0.9), ]
+
+pheatmap::pheatmap(keratin_aves_filtered)
+
+pheatmap::pheatmap(keratin_aves_top)
+
+DotPlot(so_epi,
+        features = row.names(keratin_aves_top),
+        cols = 'RdYlBu')+
+  coord_flip()+
+  RotatedAxis()
+
+rec_goi <- c('Esr1', 'Pgr', 'Erbb2')
+lum_goi <- c('Krt7', 'Krt8', 'Krt18', 'Krt19', 'Muc1', 'Mme', 'Cd24a')
+bas_goi <- c('Krt5', 'Krt14', 'Krt17', 'Cd44', 'Itga6')
+myo_goi <- c('Acta1', 'Acta2', 'Mylk')
+immsupp_goi <- c('Pdcd1', 'Pdcd1lg2', 'Ido1', 'Ido2', 'Tgfb1', 'Ccl2', 'Ccl5', 'Gal', 'Cd47', 'Hla-g')
+drivers = c('Myc', 'Pten')
+
+DotPlot(so_epi,
+        features = list(Subtype = rec_goi,
+                        Luminal = lum_goi,
+                        Basal = bas_goi,
+                        Myoepithelial = myo_goi,
+                        Immunosuppressive = immsupp_goi,
+                        Drivers = drivers),
+        cols = 'RdYlBu',
+        scale = FALSE)+
+  RotatedAxis()
+```
+
+## Lymphoid marker expression
+
+```{r}
+lym_goi <- c('Cd3e', 'Cd3g', 'Cd4', 'Cd8a', 'Foxp3', 'Ikzf2', 'Cd19', 'Cd27', 'Igha', 'Sdc1', 'Trdc', 'Mki67', 'Slamf7', 'Cd80', 'Nt5e', 'Pdcd1lg2', 'Ifitm3')
+
+DotPlot(so_lym,
+        features = lym_goi,
+        cols = 'RdYlBu')+
+  RotatedAxis()
+
+DimPlot(so_lym,
+        label = TRUE)+
+  coord_equal()
+
+# T cell receptor components
+tcr_goi <- c('Trac', 'Trdc', 'Trdv4', 'Tcrg-C1')
+DotPlot(so_lym,
+        features = tcr_goi,
+        cols = 'RdYlBu')+
+  RotatedAxis()
+
+```
+
+## Myeloid marker expression
+
+```{r}
+mye_goi <- c('Ptprc', 'Itgax', 'Itgam', 'Itgae', 'Adgre1', 'Cd14', 'Cd74', 'S100a8', 'S100a9', 'Cd103', 'Cd40', 'Cd80', 'Cd86', 'Ccr7', 'Il10', 'Il12b', 'Tnf', 'Myo1g', 'Cxcl16', 'Adam8', 'Icam1', 'Fscn1', 'Marcks', 'Marcksl1')
+
+DotPlot(so_mye,
+        features = mye_goi,
+        cols = 'RdYlBu')+
+  RotatedAxis()
+
+DimPlot(so_mye,
+        label = TRUE)+
+  coord_equal()
+
+# mReg vs DC1 vs DC2 markers
+
+dc_goi <- c('Ccr7', 'Fscn1', 'Cd40', 'Cd274', 'Pdcd1lg2', 'Cd200', 'Fas', 'Aldh1a2', 'Il4ra', 'Il4i1', 'Socs2', 'Relb', 'Xcr1', 'Clec9a', 'Cadm1', 'Naaa', 'Cd209a', 'Sirpa', 'H2-DMb2', 'Itgam', 'Itgae', 'Irf7', 'Irf8')
+
+DotPlot(so_mye,
+        features = dc_goi,
+        cols = 'RdYlBu')+
+  RotatedAxis()
+
+DotPlot(so_mye,
+        features = list(neut = c('S100a8', 'S100a9', 'Retnlg', 'Mpo', 'Elane'),
+                        mono = c('Lyz2', 'Fcgr1', 'Ccr2', 'Cx3cr1', 'S100a4', 'S100a6'),
+                        Macro = c('Adgre1', 'Cd68', 'Lgals3', 'Mertk', 'C1qa', 'C1qb'),
+                        DC = c('Xcr1', 'Clec9a', 'Batf3', 'Irf8', 'Cdc42', 'Sirpa', 'Itgam', 'Irf4', 'Siglech', 'Bst2')),
+        cols = 'RdYlBu',
+        cluster.idents = TRUE)+
+  RotatedAxis()
+
+```
+
+## Stromal canonical markers
+
+```{r}
+str_goi <- c('Acta1', 'Acta2', 'Fap', 'Pdgfra', 'Pdgfrb', 'Pecam1', 'Il6', 'Il11', 'Il17b', 'Dpp4', 'Spp1')
+
+DotPlot(so_str,
+        features = str_goi,
+        cols = 'RdYlBu')+
+  RotatedAxis()
+```
+
+
+# Generate or read cluster_l2 dictionary
+
+```{r}
+if(!file.exists('s4_cl2_dict.csv')){
+  print('Creating empty cluster_l2<->celltype dictionary - needs to be filled in with celltype labels')
+  cl2_dict <- tibble(cluster_l2 = c(unique(so_epi@meta.data$cluster_l2),
+                                    unique(so_lym@meta.data$cluster_l2),
+                                    unique(so_mye@meta.data$cluster_l2),
+                                    unique(so_str@meta.data$cluster_l2)),
+                   celltype = '') %>%
+    arrange(cluster_l2)
+  
+  write_csv(cl2_dict, 's4_cl2_dict.csv')
+}else{
+  print('Loading cluster_l2<->celltype dictionary')
+  cl2_dict <- read_csv('s4_cl2_dict.csv')
+}
+```
+
+
+## Use celltype dictionary to label each cluster_l2 then save .rds
+
+```{r}
+# Assemble barcode <-> cluster_l2 assignments
+epi_ids <- tibble(cell_barcode = row.names(so_epi@meta.data),
+                  cluster_l2 = so_epi@meta.data$cluster_l2)
+
+lym_ids <- tibble(cell_barcode = row.names(so_lym@meta.data),
+                  cluster_l2 = so_lym@meta.data$cluster_l2)
+
+mye_ids <- tibble(cell_barcode = row.names(so_mye@meta.data),
+                  cluster_l2 = so_mye@meta.data$cluster_l2)
+
+str_ids <- tibble(cell_barcode = row.names(so_str@meta.data),
+                  cluster_l2 = so_str@meta.data$cluster_l2)
+
+# Combine
+full_ids <- rbind(epi_ids,
+                  lym_ids,
+                  mye_ids,
+                  str_ids)
+
+# Add celltype label
+full_ids$celltype_l2 <- plyr::mapvalues(x = full_ids$cluster_l2,
+                                     from = cl2_dict$cluster_l2,
+                                     to = cl2_dict$celltype_l2)
+
+full_ids$celltype_l1 <- plyr::mapvalues(x = full_ids$cluster_l2,
+                                     from = cl2_dict$cluster_l2,
+                                     to = cl2_dict$celltype_l1)
+
+# Join to so_merge@meta.data
+
+new_meta <- left_join(x = so_merge@meta.data,
+                                y = full_ids,
+                                by = 'cell_barcode')
+
+row.names(new_meta) <- row.names(so_merge@meta.data)
+
+so_merge@meta.data <- new_meta
+
+Idents(so_merge) <- 'celltype_l2'
+
+saveRDS(so_merge, file = 'analysis_files/s4_so_merge_celltypes.rds')
+```
+
+
+# sessionInfo()
+
+```{r}
+sessionInfo()
+```
+
